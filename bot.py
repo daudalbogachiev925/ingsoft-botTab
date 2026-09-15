@@ -529,6 +529,26 @@ def check_sub():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    # ============================================================
+# CORS — чтобы игра с GitHub Pages могла стучаться на сервер
+# ============================================================
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+
+@app.route('/register', methods=['OPTIONS'])
+@app.route('/login', methods=['OPTIONS'])
+@app.route('/save-progress', methods=['OPTIONS'])
+@app.route('/get-progress', methods=['OPTIONS'])
+@app.route('/referrals', methods=['OPTIONS'])
+@app.route('/referral-stats', methods=['OPTIONS'])
+def options_handler():
+    return '', 204
+
 
 @app.route('/')
 def index():
