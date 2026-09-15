@@ -113,8 +113,8 @@ def get_referral_reward(friend_number):
     1-й друг → 100 IS
     2-й друг → 200 IS
     3-й друг → 250 IS
-    4-100 → 300 IS за каждого
-    100+ → 100 IS за каждого
+    4-100 → 100 IS за каждого
+    100+ → 300 IS за каждого
     """
     if friend_number <= 0:
         return 0
@@ -125,8 +125,8 @@ def get_referral_reward(friend_number):
     if friend_number == 3:
         return 250
     if friend_number > 100:
-        return 100
-    return 300
+        return 300
+    return 100
 
 
 # ============================================================
