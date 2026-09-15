@@ -103,7 +103,7 @@ def register():
         c.execute('SELECT id FROM users WHERE login = ?', (login,))
         if c.fetchone():
             conn.close()
-            return jsonify({"error": "Логин уже занят"}), 400
+            return jsonify({"error": "Такой логин уже занят"}), 400
 
         password_hash = hash_password(password)
         token = generate_token()
@@ -286,7 +286,7 @@ def check_sub():
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "bot": "IngSoft Check Bot"})
 
 
 @app.route('/ping')
