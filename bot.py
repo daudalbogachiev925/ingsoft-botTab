@@ -61,7 +61,6 @@ def init_db():
     )''')
     conn.commit()
 
-    # === МИГРАЦИЯ: добавляем referrer_id, если база была создана раньше ===
     c.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in c.fetchall()]
     if 'referrer_id' not in cols:
@@ -83,7 +82,6 @@ def generate_token():
     return secrets.token_hex(32)
 
 
-# === СПИСОК ВСЕХ КОЛОНОК ТАБЛИЦЫ (в правильном порядке) ===
 USER_COLUMNS = ['id','login','password_hash','token','nickname','gender','region','phone',
                 'full_name','telegram_id','referrer_id','score','energy','max_energy',
                 'multiplier','level','total_taps','is_balance','daily_tap_limit','taps_today',
@@ -94,7 +92,6 @@ USER_COLUMNS = ['id','login','password_hash','token','nickname','gender','region
 
 
 def row_to_user(row):
-    """Преобразует строку БД в словарь пользователя."""
     u = dict(zip(USER_COLUMNS, row))
     u.pop('password_hash', None)
     u['is_tasks_done'] = json.loads(u.get('is_tasks_done') or '[]')
@@ -108,14 +105,6 @@ def row_to_user(row):
 
 
 def get_referral_reward(friend_number):
-    """
-    Награда за N-го друга:
-    1-й друг → 100 IS
-    2-й друг → 200 IS
-    3-й друг → 250 IS
-    4-100 → 100 IS за каждого
-    100+ → 300 IS за каждого
-    """
     if friend_number <= 0:
         return 0
     if friend_number == 1:
@@ -127,6 +116,17 @@ def get_referral_reward(friend_number):
     if friend_number > 100:
         return 300
     return 100
+
+
+# ============================================================
+# CORS — чтобы игра с GitHub Pages могла стучаться на сервер
+# ============================================================
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 
 
 # ============================================================
@@ -147,7 +147,6 @@ def register():
         referrer_nickname = (data.get('referrer_nickname') or '').strip()
         referrer_telegram_id = data.get('referrer_id')
 
-        # === ВАЛИДАЦИЯ ===
         if len(login) < 3:
             return jsonify({"error": "Логин минимум 3 символа"}), 400
         if len(password) < 6:
@@ -166,23 +165,19 @@ def register():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Проверка логина
         c.execute('SELECT id FROM users WHERE login = ?', (login,))
         if c.fetchone():
             conn.close()
             return jsonify({"error": "Такой логин уже занят"}), 400
 
-        # Проверка никнейма
         c.execute('SELECT id FROM users WHERE LOWER(nickname) = LOWER(?)', (nickname,))
         if c.fetchone():
             conn.close()
             return jsonify({"error": "Такой никнейм уже занят"}), 400
 
-        # === ИЩЕМ РЕФЕРЕРА ===
         referrer_user_id = None
         referrer_found_by = None
 
-        # 1) Сначала по никнейму
         if referrer_nickname and referrer_nickname.lower() != nickname.lower():
             c.execute('SELECT id FROM users WHERE LOWER(nickname) = LOWER(?)', (referrer_nickname,))
             ref_row = c.fetchone()
@@ -191,7 +186,6 @@ def register():
                 referrer_found_by = 'nickname'
                 print(f"✅ Реферер найден по нику: {referrer_nickname} (id={referrer_user_id})")
 
-        # 2) Если по нику не нашли — пробуем по telegram_id
         if not referrer_user_id and referrer_telegram_id and referrer_telegram_id != telegram_id:
             c.execute('SELECT id FROM users WHERE telegram_id = ?', (referrer_telegram_id,))
             ref_row = c.fetchone()
@@ -213,11 +207,9 @@ def register():
         conn.commit()
         user_id = c.lastrowid
 
-        # === НАЧИСЛЯЕМ НАГРАДУ РЕФЕРЕРУ ===
         referral_reward = 0
         friend_number = 0
         if referrer_user_id:
-            # Считаем сколько друзей у реферера УЖЕ было
             c.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (referrer_user_id,))
             existing_friends = c.fetchone()[0]
             friend_number = existing_friends + 1
@@ -361,7 +353,7 @@ def save_progress():
 
 
 # ============================================================
-# 🆕 СПИСОК ДРУЗЕЙ (РЕФЕРАЛОВ)
+# СПИСОК ДРУЗЕЙ (РЕФЕРАЛОВ)
 # ============================================================
 @app.route('/referrals', methods=['GET'])
 def referrals():
@@ -399,7 +391,7 @@ def referrals():
 
 
 # ============================================================
-# 🆕 СТАТИСТИКА ПО РЕФЕРАЛАМ (для вкладки "Бонус")
+# СТАТИСТИКА ПО РЕФЕРАЛАМ
 # ============================================================
 @app.route('/referral-stats', methods=['GET'])
 def referral_stats():
@@ -421,7 +413,6 @@ def referral_stats():
         count = c.fetchone()[0]
         conn.close()
 
-        # Считаем общую сумму
         total = 0
         for i in range(1, count + 1):
             total += get_referral_reward(i)
@@ -438,8 +429,7 @@ def referral_stats():
 
 
 # ============================================================
-# 🆕 ВСЕ ПОЛЬЗОВАТЕЛИ (для админки)
-# Открой: https://ingsofttap.bothost.tech/admin/users
+# ВСЕ ПОЛЬЗОВАТЕЛИ (админка)
 # ============================================================
 @app.route('/admin/users', methods=['GET'])
 def admin_users():
@@ -475,9 +465,7 @@ def admin_users():
 
 
 # ============================================================
-# 🆕 РУЧНОЙ ПЕРЕСЧЁТ РЕФЕРАЛЬНЫХ НАГРАД
-# Если что-то пошло не так и нужно пересчитать всем баланс
-# Открой: https://ingsofttap.bothost.tech/admin/recalc-referrals
+# РУЧНОЙ ПЕРЕСЧЁТ РЕФЕРАЛЬНЫХ НАГРАД
 # ============================================================
 @app.route('/admin/recalc-referrals', methods=['GET'])
 def admin_recalc_referrals():
@@ -485,7 +473,6 @@ def admin_recalc_referrals():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Получаем всех, у кого есть рефералы
         c.execute('''SELECT referrer_id, COUNT(*) as cnt 
                      FROM users 
                      WHERE referrer_id IS NOT NULL 
@@ -528,26 +515,6 @@ def check_sub():
         return jsonify({"error": str(e)}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    # ============================================================
-# CORS — чтобы игра с GitHub Pages могла стучаться на сервер
-# ============================================================
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    return response
-
-
-@app.route('/register', methods=['OPTIONS'])
-@app.route('/login', methods=['OPTIONS'])
-@app.route('/save-progress', methods=['OPTIONS'])
-@app.route('/get-progress', methods=['OPTIONS'])
-@app.route('/referrals', methods=['OPTIONS'])
-@app.route('/referral-stats', methods=['OPTIONS'])
-def options_handler():
-    return '', 204
 
 
 @app.route('/')
