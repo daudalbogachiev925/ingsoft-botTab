@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 import telebot
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 PORT = int(os.environ.get('PORT', 5000))
@@ -13,6 +14,7 @@ DB_PATH = 'ingsoft.db'
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 
 def init_db():
