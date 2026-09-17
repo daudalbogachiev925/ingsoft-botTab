@@ -2,11 +2,8 @@ import os
 import time
 import json
 import sqlite3
-import random
-import string
 import hashlib
 import secrets
-from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,19 +15,12 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# --- Путь к БД (Bothost хранит в /app/data) ---
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 DB_PATH = os.path.join(DATA_DIR, 'ingsoft.db')
 
-# --- Параметры ---
-SUB_REWARD = 50
-SUB_PENALTY = 500
 ONLINE_WINDOW_MS = 5 * 60 * 1000  # 5 минут = онлайн
 
 
-# ============================================================
-#  ИНИЦИАЛИЗАЦИЯ БД
-# ============================================================
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -84,7 +74,7 @@ def init_db():
         )
     """)
 
-    # Добавляем столбцы если их нет (миграция)
+    # Миграции — добавляем столбцы если их нет
     for col, ddl in [
         ('last_seen', 'INTEGER DEFAULT 0'),
         ('avatar_data', 'TEXT'),
@@ -96,6 +86,20 @@ def init_db():
             print(f"[MIGRATION] добавлен столбец {col}")
         except Exception:
             pass
+
+    # ===== ЧАТ =====
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nickname TEXT NOT NULL,
+            gender TEXT NOT NULL,
+            region TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    print("[DB] Таблица messages готова")
 
     conn.commit()
     conn.close()
@@ -201,7 +205,6 @@ def get_progress():
     user = dict(row)
     user.pop('password', None)
 
-    # Парсим JSON-поля
     for field in ['is_tasks_done', 'claimed_quests', 'claimed_promos', 'upgrades', 'earned_promocodes']:
         try:
             user[field] = json.loads(user.get(field) or '[]')
@@ -223,36 +226,17 @@ def save_progress():
 
     conn = get_db()
     c = conn.cursor()
-
     now_ms = int(time.time() * 1000)
 
     c.execute("""
         UPDATE users SET
-            score = ?,
-            energy = ?,
-            max_energy = ?,
-            multiplier = ?,
-            level = ?,
-            total_taps = ?,
-            is_balance = ?,
-            daily_tap_limit = ?,
-            taps_today = ?,
-            last_tap_date = ?,
-            sub_was_subscribed = ?,
-            sub_was_punished = ?,
-            is_tasks_done = ?,
-            claimed_quests = ?,
-            claimed_promos = ?,
-            upgrades = ?,
-            unlimited_until = ?,
-            is_boost_mult_until = ?,
-            is_auto_tap_until = ?,
-            autotap_level = ?,
-            passive_income = ?,
-            wallet_balance = ?,
-            wallet_total = ?,
-            earned_promocodes = ?,
-            last_seen = ?
+            score = ?, energy = ?, max_energy = ?, multiplier = ?, level = ?,
+            total_taps = ?, is_balance = ?, daily_tap_limit = ?, taps_today = ?,
+            last_tap_date = ?, sub_was_subscribed = ?, sub_was_punished = ?,
+            is_tasks_done = ?, claimed_quests = ?, claimed_promos = ?, upgrades = ?,
+            unlimited_until = ?, is_boost_mult_until = ?, is_auto_tap_until = ?,
+            autotap_level = ?, passive_income = ?, wallet_balance = ?, wallet_total = ?,
+            earned_promocodes = ?, last_seen = ?
         WHERE token = ?
     """, (
         data.get('score', 0),
@@ -293,7 +277,7 @@ def save_progress():
 
 
 # ============================================================
-#  HEARTBEAT — обновляет last_seen (кто онлайн)
+#  HEARTBEAT — онлайн
 # ============================================================
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -406,12 +390,97 @@ def claim_referral():
 
 
 # ============================================================
-#  ПОДПИСКА НА КАНАЛ
+#  ПОДПИСКА
 # ============================================================
 @app.route('/check-sub', methods=['GET'])
 def check_sub():
-    # Заглушка — здесь должна быть проверка через Telegram Bot API
     return jsonify({'subscribed': True})
+
+
+# ============================================================
+#  ============ ЧАТ (только Ингушетия) ============
+# ============================================================
+
+@app.route('/send-message', methods=['POST'])
+def send_message():
+    data = request.get_json() or {}
+    token = data.get('token')
+    text = (data.get('text') or '').strip()
+
+    if not token or not text:
+        return jsonify({'success': False, 'error': 'Пустое сообщение'}), 400
+    if len(text) > 500:
+        return jsonify({'success': False, 'error': 'Слишком длинное (макс 500)'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, nickname, gender, region FROM users WHERE token = ?", (token,))
+    u = c.fetchone()
+    if not u:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Пользователь не найден'}), 401
+
+    # Только для Ингушетии
+    region = (u['region'] or '').strip().lower()
+    if region != 'ингушетия':
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат только для Ингушетии'}), 403
+
+    gender = (u['gender'] or 'male').strip().lower()
+    if gender not in ('male', 'female'):
+        gender = 'male'
+
+    c.execute("""INSERT INTO messages (user_id, nickname, gender, region, text, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)""",
+              (u['id'], u['nickname'], gender, u['region'], text, int(time.time() * 1000)))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/get-messages', methods=['GET'])
+def get_messages():
+    """chat = male | female"""
+    token = request.args.get('token', '')
+    chat = (request.args.get('chat', 'male') or 'male').lower()
+    if chat not in ('male', 'female'):
+        chat = 'male'
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Проверяем права
+    if token:
+        c.execute("SELECT region FROM users WHERE token = ?", (token,))
+        u = c.fetchone()
+        if u:
+            if (u['region'] or '').strip().lower() != 'ингушетия':
+                conn.close()
+                return jsonify({'success': False, 'error': 'Чат только для Ингушетии', 'messages': []})
+        else:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Не авторизован', 'messages': []})
+
+    c.execute("""
+        SELECT id, nickname, gender, text, created_at
+        FROM messages
+        WHERE gender = ?
+        ORDER BY id DESC
+        LIMIT 100
+    """, (chat,))
+    rows = c.fetchall()
+    conn.close()
+
+    messages = [{
+        'id': r['id'],
+        'nickname': r['nickname'],
+        'gender': r['gender'],
+        'text': r['text'],
+        'created_at': r['created_at']
+    } for r in rows]
+
+    messages.reverse()  # старые сверху
+    return jsonify({'success': True, 'messages': messages})
 
 
 # ============================================================
