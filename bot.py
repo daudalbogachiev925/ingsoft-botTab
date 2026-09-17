@@ -9,17 +9,12 @@ import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ============================================================
-#  INGSOFT TAP — BACKEND
-# ============================================================
-
 app = Flask(__name__)
 CORS(app)
 
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 DB_PATH = os.path.join(DATA_DIR, 'ingsoft.db')
-
-ONLINE_WINDOW_MS = 5 * 60 * 1000  # 5 минут = онлайн
+ONLINE_WINDOW_MS = 5 * 60 * 1000
 
 
 def get_db():
@@ -87,7 +82,6 @@ def init_db():
         except Exception:
             pass
 
-    # ===== ЧАТ =====
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +94,6 @@ def init_db():
         )
     """)
     print("[DB] Таблица messages готова")
-
     conn.commit()
     conn.close()
     print("[DB] Инициализация завершена")
@@ -114,9 +107,6 @@ def generate_token():
     return secrets.token_urlsafe(32)
 
 
-# ============================================================
-#  АВТОРИЗАЦИЯ
-# ============================================================
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
@@ -214,9 +204,6 @@ def get_progress():
     return jsonify({'found': True, 'user': user})
 
 
-# ============================================================
-#  СОХРАНЕНИЕ ПРОГРЕССА
-# ============================================================
 @app.route('/save-progress', methods=['POST'])
 def save_progress():
     data = request.get_json() or {}
@@ -276,9 +263,6 @@ def save_progress():
     return jsonify({'ok': True})
 
 
-# ============================================================
-#  HEARTBEAT
-# ============================================================
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.get_json() or {}
@@ -300,9 +284,6 @@ def heartbeat():
     return jsonify({'ok': True})
 
 
-# ============================================================
-#  ТОП
-# ============================================================
 @app.route('/top', methods=['GET'])
 def get_top():
     limit = int(request.args.get('limit', 100))
@@ -348,9 +329,6 @@ def get_top():
     })
 
 
-# ============================================================
-#  РЕФЕРАЛЫ
-# ============================================================
 @app.route('/my-referrals', methods=['GET'])
 def my_referrals():
     token = request.args.get('token')
@@ -394,10 +372,6 @@ def check_sub():
     return jsonify({'subscribed': True})
 
 
-# ============================================================
-#  ============ ЧАТ (только Ингушетия, раздельно М/Ж) ============
-# ============================================================
-
 def _get_user_by_token(token):
     conn = get_db()
     c = conn.cursor()
@@ -427,7 +401,6 @@ def send_message():
         if region != 'ингушетия':
             return jsonify({'success': False, 'error': 'Чат только для Ингушетии'}), 403
 
-        # 🔒 пол пользователя — определяет, в какой чат он может писать
         gender = (u['gender'] or 'male').strip().lower()
         if gender not in ('male', 'female'):
             gender = 'male'
@@ -448,12 +421,6 @@ def send_message():
 
 @app.route('/get-messages', methods=['GET'])
 def get_messages():
-    """
-    Каждый видит ТОЛЬКО свой чат:
-      - парень  → только 'male'
-      - девочка → только 'female'
-    Параметр chat с фронта игнорируется — берём пол игрока из БД.
-    """
     try:
         token = request.args.get('token', '')
         if not token:
@@ -467,7 +434,6 @@ def get_messages():
         if region != 'ингушетия':
             return jsonify({'success': False, 'error': 'Чат только для Ингушетии', 'messages': []})
 
-        # 🔒 принудительно берём чат по полу игрока
         my_gender = (u['gender'] or 'male').strip().lower()
         if my_gender not in ('male', 'female'):
             my_gender = 'male'
@@ -500,9 +466,6 @@ def get_messages():
         return jsonify({'success': False, 'error': 'Ошибка сервера', 'messages': []}), 500
 
 
-# ============================================================
-#  ЗАПУСК
-# ============================================================
 init_db()
 
 if __name__ == '__main__':
