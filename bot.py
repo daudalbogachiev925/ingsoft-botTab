@@ -4,6 +4,7 @@ import json
 import sqlite3
 import hashlib
 import secrets
+import traceback
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -74,7 +75,6 @@ def init_db():
         )
     """)
 
-    # Миграции — добавляем столбцы если их нет
     for col, ddl in [
         ('last_seen', 'INTEGER DEFAULT 0'),
         ('avatar_data', 'TEXT'),
@@ -277,7 +277,7 @@ def save_progress():
 
 
 # ============================================================
-#  HEARTBEAT — онлайн
+#  HEARTBEAT
 # ============================================================
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -301,7 +301,7 @@ def heartbeat():
 
 
 # ============================================================
-#  ТОП ИГРОКОВ
+#  ТОП
 # ============================================================
 @app.route('/top', methods=['GET'])
 def get_top():
@@ -389,98 +389,115 @@ def claim_referral():
     return jsonify({'success': True})
 
 
-# ============================================================
-#  ПОДПИСКА
-# ============================================================
 @app.route('/check-sub', methods=['GET'])
 def check_sub():
     return jsonify({'subscribed': True})
 
 
 # ============================================================
-#  ============ ЧАТ (только Ингушетия) ============
+#  ============ ЧАТ (только Ингушетия, раздельно М/Ж) ============
 # ============================================================
 
-@app.route('/send-message', methods=['POST'])
-def send_message():
-    data = request.get_json() or {}
-    token = data.get('token')
-    text = (data.get('text') or '').strip()
-
-    if not token or not text:
-        return jsonify({'success': False, 'error': 'Пустое сообщение'}), 400
-    if len(text) > 500:
-        return jsonify({'success': False, 'error': 'Слишком длинное (макс 500)'}), 400
-
+def _get_user_by_token(token):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, nickname, gender, region FROM users WHERE token = ?", (token,))
     u = c.fetchone()
-    if not u:
-        conn.close()
-        return jsonify({'success': False, 'error': 'Пользователь не найден'}), 401
-
-    # Только для Ингушетии
-    region = (u['region'] or '').strip().lower()
-    if region != 'ингушетия':
-        conn.close()
-        return jsonify({'success': False, 'error': 'Чат только для Ингушетии'}), 403
-
-    gender = (u['gender'] or 'male').strip().lower()
-    if gender not in ('male', 'female'):
-        gender = 'male'
-
-    c.execute("""INSERT INTO messages (user_id, nickname, gender, region, text, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)""",
-              (u['id'], u['nickname'], gender, u['region'], text, int(time.time() * 1000)))
-    conn.commit()
     conn.close()
-    return jsonify({'success': True})
+    return u
+
+
+@app.route('/send-message', methods=['POST'])
+def send_message():
+    try:
+        data = request.get_json() or {}
+        token = data.get('token')
+        text = (data.get('text') or '').strip()
+
+        if not token or not text:
+            return jsonify({'success': False, 'error': 'Пустое сообщение'}), 400
+        if len(text) > 500:
+            return jsonify({'success': False, 'error': 'Слишком длинное (макс 500)'}), 400
+
+        u = _get_user_by_token(token)
+        if not u:
+            return jsonify({'success': False, 'error': 'Пользователь не найден'}), 401
+
+        region = (u['region'] or '').strip().lower()
+        if region != 'ингушетия':
+            return jsonify({'success': False, 'error': 'Чат только для Ингушетии'}), 403
+
+        # 🔒 пол пользователя — определяет, в какой чат он может писать
+        gender = (u['gender'] or 'male').strip().lower()
+        if gender not in ('male', 'female'):
+            gender = 'male'
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""INSERT INTO messages (user_id, nickname, gender, region, text, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?)""",
+                  (u['id'], u['nickname'], gender, u['region'], text, int(time.time() * 1000)))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        print("[send-message ERROR]", e)
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': 'Ошибка сервера'}), 500
 
 
 @app.route('/get-messages', methods=['GET'])
 def get_messages():
-    """chat = male | female"""
-    token = request.args.get('token', '')
-    chat = (request.args.get('chat', 'male') or 'male').lower()
-    if chat not in ('male', 'female'):
-        chat = 'male'
-
-    conn = get_db()
-    c = conn.cursor()
-
-    # Проверяем права
-    if token:
-        c.execute("SELECT region FROM users WHERE token = ?", (token,))
-        u = c.fetchone()
-        if u:
-            if (u['region'] or '').strip().lower() != 'ингушетия':
-                conn.close()
-                return jsonify({'success': False, 'error': 'Чат только для Ингушетии', 'messages': []})
-        else:
-            conn.close()
+    """
+    Каждый видит ТОЛЬКО свой чат:
+      - парень  → только 'male'
+      - девочка → только 'female'
+    Параметр chat с фронта игнорируется — берём пол игрока из БД.
+    """
+    try:
+        token = request.args.get('token', '')
+        if not token:
             return jsonify({'success': False, 'error': 'Не авторизован', 'messages': []})
 
-    c.execute("""
-        SELECT id, nickname, gender, text, created_at
-        FROM messages
-        WHERE gender = ?
-        ORDER BY id DESC
-        LIMIT 100
-    """, (chat,))
-    rows = c.fetchall()
-    conn.close()
+        u = _get_user_by_token(token)
+        if not u:
+            return jsonify({'success': False, 'error': 'Не авторизован', 'messages': []})
 
-    messages = [{
-        'id': r['id'],
-        'nickname': r['nickname'],
-        'gender': r['gender'],
-        'text': r['text'],
-        'created_at': r['created_at']
-    } for r in rows]
+        region = (u['region'] or '').strip().lower()
+        if region != 'ингушетия':
+            return jsonify({'success': False, 'error': 'Чат только для Ингушетии', 'messages': []})
 
-    messages.reverse()  # старые сверху
-    return jsonify({'success': True, 'messages': messages})
+        # 🔒 принудительно берём чат по полу игрока
+        my_gender = (u['gender'] or 'male').strip().lower()
+        if my_gender not in ('male', 'female'):
+            my_gender = 'male'
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, nickname, gender, text, created_at
+            FROM messages
+            WHERE gender = ?
+            ORDER BY id DESC
+            LIMIT 100
+        """, (my_gender,))
+        rows = c.fetchall()
+        conn.close()
+
+        messages = [{
+            'id': r['id'],
+            'nickname': r['nickname'],
+            'gender': r['gender'],
+            'text': r['text'],
+            'created_at': r['created_at']
+        } for r in rows]
+
+        messages.reverse()
+        return jsonify({'success': True, 'messages': messages, 'chat': my_gender})
+    except Exception as e:
+        print("[get-messages ERROR]", e)
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': 'Ошибка сервера', 'messages': []}), 500
 
 
 # ============================================================
