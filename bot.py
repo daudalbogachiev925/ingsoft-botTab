@@ -165,6 +165,15 @@ def register():
     ref_nick = data.get('referrer_nickname')
     ref_id = data.get('referrer_id')
 
+    # Нормализуем referrer_id
+    if ref_id:
+        try:
+            ref_id = int(ref_id)
+            if ref_id <= 0:
+                ref_id = None
+        except Exception:
+            ref_id = None
+
     if len(login) < 3:
         return jsonify({'error': 'Логин минимум 3 символа'}), 400
     if len(password) < 6:
@@ -187,6 +196,17 @@ def register():
             int(time.time() * 1000), int(time.time() * 1000)
         ))
         conn.commit()
+        new_user_id = c.lastrowid
+
+        # Если пришёл ref_id — проверим, что такой игрок есть, и запишем ник
+        if ref_id:
+            c.execute("SELECT id, nickname FROM users WHERE id = ?", (ref_id,))
+            referrer = c.fetchone()
+            if referrer:
+                c.execute("UPDATE users SET referrer_nickname = ? WHERE id = ?",
+                          (referrer['nickname'], new_user_id))
+                conn.commit()
+
         return jsonify({'ok': True})
     except sqlite3.IntegrityError:
         return jsonify({'error': 'Логин уже занят'}), 400
@@ -409,6 +429,21 @@ def get_top():
     })
 
 
+@app.route('/my-id', methods=['GET'])
+def my_id():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'success': False}), 400
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, nickname FROM users WHERE token = ?", (token,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'success': False}), 401
+    return jsonify({'success': True, 'id': row['id'], 'nickname': row['nickname']})
+
+
 @app.route('/my-referrals', methods=['GET'])
 def my_referrals():
     token = request.args.get('token')
@@ -417,14 +452,18 @@ def my_referrals():
 
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT nickname FROM users WHERE token = ?", (token,))
+    c.execute("SELECT id, nickname FROM users WHERE token = ?", (token,))
     me = c.fetchone()
     if not me:
         conn.close()
         return jsonify({'success': False, 'referrals': []})
 
-    my_nick = me['nickname']
-    c.execute("SELECT nickname FROM users WHERE referrer_nickname = ?", (my_nick,))
+    my_id = me['id']
+    # Ищем по referrer_id (числовой), а старые по нику оставляем для совместимости
+    c.execute("""SELECT nickname FROM users
+                 WHERE referrer_id = ? OR referrer_nickname = ?
+                 ORDER BY id ASC""",
+              (my_id, me['nickname']))
     refs = [{'nickname': r['nickname']} for r in c.fetchall()]
     conn.close()
     return jsonify({'success': True, 'referrals': refs})
