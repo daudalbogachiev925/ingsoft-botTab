@@ -113,6 +113,19 @@ def init_db():
             joined_at INTEGER NOT NULL
         )
     """)
+    for col, ddl in [
+        ('is_admin', 'INTEGER DEFAULT 0'),
+        ('can_delete_messages', 'INTEGER DEFAULT 0'),
+        ('can_kick', 'INTEGER DEFAULT 0'),
+        ('can_pin', 'INTEGER DEFAULT 0'),
+        ('can_edit', 'INTEGER DEFAULT 0'),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE group_members ADD COLUMN {col} {ddl}")
+            print(f"[MIGRATION] group_members.{col}")
+        except Exception:
+            pass
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS group_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -815,15 +828,28 @@ def groups_members():
         conn.close()
         return jsonify({'success': False, 'error': 'Нет доступа'}), 403
 
-    c.execute("""SELECT u.id, u.nickname, u.gender, gm.joined_at
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    owner_id = chat['owner_id'] if chat else None
+
+    c.execute("""SELECT u.id, u.nickname, u.gender, gm.joined_at,
+                        gm.is_admin, gm.can_delete_messages, gm.can_kick, gm.can_pin, gm.can_edit
                  FROM group_members gm
                  JOIN users u ON u.id = gm.user_id
                  WHERE gm.chat_id = ?
                  ORDER BY gm.joined_at ASC""", (chat_id,))
-    members = [{'id': r['id'], 'nickname': r['nickname'], 'gender': r['gender'],
-                'joined_at': r['joined_at']} for r in c.fetchall()]
+    members = [{
+        'id': r['id'], 'nickname': r['nickname'], 'gender': r['gender'],
+        'joined_at': r['joined_at'],
+        'is_owner': r['id'] == owner_id,
+        'is_admin': bool(r['is_admin']),
+        'can_delete_messages': bool(r['can_delete_messages']),
+        'can_kick': bool(r['can_kick']),
+        'can_pin': bool(r['can_pin']),
+        'can_edit': bool(r['can_edit'])
+    } for r in c.fetchall()]
     conn.close()
-    return jsonify({'success': True, 'members': members})
+    return jsonify({'success': True, 'members': members, 'owner_id': owner_id})
 
 
 @app.route('/groups/send', methods=['POST'])
@@ -875,18 +901,274 @@ def groups_messages():
         conn.close()
         return jsonify({'success': False, 'error': 'Нет доступа', 'messages': []}), 403
 
-    c.execute("""SELECT id, nickname, text, created_at
+    c.execute("""SELECT id, user_id, nickname, text, created_at
                  FROM group_messages
                  WHERE chat_id = ?
                  ORDER BY id DESC
                  LIMIT 100""", (chat_id,))
     rows = c.fetchall()
+
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat_row = c.fetchone()
+    owner_id = chat_row['owner_id'] if chat_row else None
+
+    c.execute("""SELECT is_admin, can_delete_messages, can_kick, can_pin, can_edit
+                 FROM group_members WHERE chat_id = ? AND user_id = ?""",
+              (chat_id, u['id']))
+    my_perm = c.fetchone()
     conn.close()
 
-    msgs = [{'id': r['id'], 'nickname': r['nickname'], 'text': r['text'],
-             'created_at': r['created_at']} for r in rows]
+    my_is_admin = bool(my_perm['is_admin']) if my_perm else False
+    my_can_del = bool(my_perm['can_delete_messages']) if my_perm else False
+    my_can_kick = bool(my_perm['can_kick']) if my_perm else False
+    my_can_pin = bool(my_perm['can_pin']) if my_perm else False
+    my_can_edit = bool(my_perm['can_edit']) if my_perm else False
+    i_am_owner = (u['id'] == owner_id)
+
+    msgs = [{
+        'id': r['id'],
+        'user_id': r['user_id'],
+        'nickname': r['nickname'],
+        'text': r['text'],
+        'created_at': r['created_at']
+    } for r in rows]
     msgs.reverse()
-    return jsonify({'success': True, 'messages': msgs})
+
+    return jsonify({
+        'success': True,
+        'messages': msgs,
+        'owner_id': owner_id,
+        'my_perms': {
+            'is_owner': i_am_owner,
+            'is_admin': my_is_admin,
+            'can_delete_messages': my_can_del,
+            'can_kick': my_can_kick,
+            'can_pin': my_can_pin,
+            'can_edit': my_can_edit
+        }
+    })
+
+
+def _check_group_perm(token, chat_id, perm_name):
+    u = _get_user_full_by_token(token)
+    if not u:
+        return None, False, False
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return u, False, False
+    is_owner = (chat['owner_id'] == u['id'])
+    if is_owner:
+        conn.close()
+        return u, True, True
+    c.execute(f"SELECT {perm_name} FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, u['id']))
+    row = c.fetchone()
+    conn.close()
+    has_perm = bool(row and row[perm_name])
+    return u, False, has_perm
+
+
+@app.route('/groups/delete', methods=['POST'])
+def groups_delete():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    if not token or not chat_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат не найден'}), 404
+    if chat['owner_id'] != u['id']:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Только владелец может удалить'}), 403
+    c.execute("DELETE FROM group_messages WHERE chat_id = ?", (chat_id,))
+    c.execute("DELETE FROM group_members WHERE chat_id = ?", (chat_id,))
+    c.execute("DELETE FROM group_chats WHERE id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/kick', methods=['POST'])
+def groups_kick():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    user_id = data.get('user_id')
+    if not token or not chat_id or not user_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    u, is_owner, has_perm = _check_group_perm(token, chat_id, 'can_kick')
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+    if not (is_owner or has_perm):
+        return jsonify({'success': False, 'error': 'Нет прав на кик'}), 403
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if chat and chat['owner_id'] == user_id:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нельзя кикнуть владельца'}), 403
+
+    c.execute("DELETE FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/message/delete', methods=['POST'])
+def groups_message_delete():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    message_id = data.get('message_id')
+    if not token or not chat_id or not message_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    u, is_owner, has_perm = _check_group_perm(token, chat_id, 'can_delete_messages')
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM group_messages WHERE id = ? AND chat_id = ?",
+              (message_id, chat_id))
+    msg = c.fetchone()
+    if not msg:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Сообщение не найдено'}), 404
+
+    is_own = (msg['user_id'] == u['id'])
+    if not (is_owner or has_perm or is_own):
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нет прав'}), 403
+
+    c.execute("DELETE FROM group_messages WHERE id = ?", (message_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/message/edit', methods=['POST'])
+def groups_message_edit():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    message_id = data.get('message_id')
+    new_text = (data.get('text') or '').strip()
+    if not token or not chat_id or not message_id or not new_text:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if len(new_text) > 500:
+        return jsonify({'success': False, 'error': 'Слишком длинное'}), 400
+    u, is_owner, has_perm = _check_group_perm(token, chat_id, 'can_edit')
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM group_messages WHERE id = ? AND chat_id = ?",
+              (message_id, chat_id))
+    msg = c.fetchone()
+    if not msg:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Сообщение не найдено'}), 404
+
+    is_own = (msg['user_id'] == u['id'])
+    if not (is_owner or has_perm or is_own):
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нет прав'}), 403
+
+    c.execute("UPDATE group_messages SET text = ? WHERE id = ?", (new_text, message_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/set-admin', methods=['POST'])
+def groups_set_admin():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    user_id = data.get('user_id')
+    is_admin = 1 if data.get('is_admin') else 0
+    perms = data.get('perms') or {}
+
+    if not token or not chat_id or not user_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат не найден'}), 404
+    if chat['owner_id'] != u['id']:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Только владелец назначает'}), 403
+
+    c.execute("""UPDATE group_members SET
+                    is_admin = ?,
+                    can_delete_messages = ?,
+                    can_kick = ?,
+                    can_pin = ?,
+                    can_edit = ?
+                 WHERE chat_id = ? AND user_id = ?""",
+              (is_admin,
+               1 if perms.get('can_delete_messages') else 0,
+               1 if perms.get('can_kick') else 0,
+               1 if perms.get('can_pin') else 0,
+               1 if perms.get('can_edit') else 0,
+               chat_id, user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/rename', methods=['POST'])
+def groups_rename():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    new_name = (data.get('name') or '').strip()
+    if not token or not chat_id or not new_name:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат не найден'}), 404
+    if chat['owner_id'] != u['id']:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Только владелец'}), 403
+
+    c.execute("UPDATE group_chats SET name = ? WHERE id = ?", (new_name, chat_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'name': new_name})
 
 
 init_db()
