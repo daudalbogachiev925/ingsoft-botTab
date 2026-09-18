@@ -95,6 +95,36 @@ def init_db():
         )
     """)
     print("[DB] Таблица messages готова")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS group_chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            invite_code TEXT UNIQUE NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at INTEGER NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS group_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            nickname TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    print("[DB] Таблицы групп готовы")
+
     conn.commit()
     conn.close()
     print("[DB] Инициализация завершена")
@@ -439,6 +469,15 @@ def _get_user_by_token(token):
     return u
 
 
+def _get_user_full_by_token(token):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, nickname, gender FROM users WHERE token = ?", (token,))
+    u = c.fetchone()
+    conn.close()
+    return u
+
+
 def _is_admin(token):
     conn = get_db()
     c = conn.cursor()
@@ -611,6 +650,243 @@ def chat_stats():
         'online_now': online_now,
         'history': history
     })
+
+
+# ============ ГРУППОВЫЕ ЧАТЫ ============
+
+@app.route('/groups/create', methods=['POST'])
+def groups_create():
+    data = request.get_json() or {}
+    token = data.get('token')
+    name = (data.get('name') or '').strip()
+    if not token or not name:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    invite_code = secrets.token_urlsafe(8)
+    now_ms = int(time.time() * 1000)
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO group_chats (name, owner_id, invite_code, created_at) VALUES (?, ?, ?, ?)",
+              (name, u['id'], invite_code, now_ms))
+    chat_id = c.lastrowid
+    c.execute("INSERT INTO group_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+              (chat_id, u['id'], now_ms))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'chat_id': chat_id, 'invite_code': invite_code, 'name': name})
+
+
+@app.route('/groups/list', methods=['GET'])
+def groups_list():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'success': False, 'chats': []})
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'chats': []})
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""SELECT gc.id, gc.name, gc.invite_code, gc.owner_id, gc.created_at
+                 FROM group_chats gc
+                 JOIN group_members gm ON gm.chat_id = gc.id
+                 WHERE gm.user_id = ?
+                 ORDER BY gc.created_at DESC""", (u['id'],))
+    chats = [{'id': r['id'], 'name': r['name'], 'invite_code': r['invite_code'],
+              'owner_id': r['owner_id'], 'is_owner': r['owner_id'] == u['id']} for r in c.fetchall()]
+    conn.close()
+    return jsonify({'success': True, 'chats': chats})
+
+
+@app.route('/groups/join', methods=['POST'])
+def groups_join():
+    data = request.get_json() or {}
+    token = data.get('token')
+    invite_code = (data.get('invite_code') or '').strip()
+    if not token or not invite_code:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, name FROM group_chats WHERE invite_code = ?", (invite_code,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат не найден'}), 404
+
+    c.execute("SELECT id FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat['id'], u['id']))
+    if c.fetchone():
+        conn.close()
+        return jsonify({'success': True, 'chat_id': chat['id'], 'name': chat['name'], 'already': True})
+
+    c.execute("INSERT INTO group_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+              (chat['id'], u['id'], int(time.time() * 1000)))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'chat_id': chat['id'], 'name': chat['name']})
+
+
+@app.route('/groups/leave', methods=['POST'])
+def groups_leave():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    if not token or not chat_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM group_members WHERE chat_id = ? AND user_id = ?", (chat_id, u['id']))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/add-member', methods=['POST'])
+def groups_add_member():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    nickname = (data.get('nickname') or '').strip()
+    if not token or not chat_id or not nickname:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT owner_id FROM group_chats WHERE id = ?", (chat_id,))
+    chat = c.fetchone()
+    if not chat:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Чат не найден'}), 404
+    if chat['owner_id'] != u['id']:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Только владелец может добавлять'}), 403
+
+    c.execute("SELECT id, nickname FROM users WHERE nickname = ?", (nickname,))
+    target = c.fetchone()
+    if not target:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Игрок не найден'}), 404
+
+    c.execute("SELECT id FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, target['id']))
+    if c.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'Уже в чате'}), 400
+
+    c.execute("INSERT INTO group_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+              (chat_id, target['id'], int(time.time() * 1000)))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'nickname': target['nickname']})
+
+
+@app.route('/groups/members', methods=['GET'])
+def groups_members():
+    token = request.args.get('token')
+    chat_id = request.args.get('chat_id')
+    if not token or not chat_id:
+        return jsonify({'success': False, 'members': []})
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'members': []})
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, u['id']))
+    if not c.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+
+    c.execute("""SELECT u.id, u.nickname, u.gender, gm.joined_at
+                 FROM group_members gm
+                 JOIN users u ON u.id = gm.user_id
+                 WHERE gm.chat_id = ?
+                 ORDER BY gm.joined_at ASC""", (chat_id,))
+    members = [{'id': r['id'], 'nickname': r['nickname'], 'gender': r['gender'],
+                'joined_at': r['joined_at']} for r in c.fetchall()]
+    conn.close()
+    return jsonify({'success': True, 'members': members})
+
+
+@app.route('/groups/send', methods=['POST'])
+def groups_send():
+    data = request.get_json() or {}
+    token = data.get('token')
+    chat_id = data.get('chat_id')
+    text = (data.get('text') or '').strip()
+    if not token or not chat_id or not text:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if len(text) > 500:
+        return jsonify({'success': False, 'error': 'Слишком длинное'}), 400
+
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, u['id']))
+    if not c.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+
+    c.execute("""INSERT INTO group_messages (chat_id, user_id, nickname, text, created_at)
+                 VALUES (?, ?, ?, ?, ?)""",
+              (chat_id, u['id'], u['nickname'], text, int(time.time() * 1000)))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/groups/messages', methods=['GET'])
+def groups_messages():
+    token = request.args.get('token')
+    chat_id = request.args.get('chat_id')
+    if not token or not chat_id:
+        return jsonify({'success': False, 'messages': []})
+    u = _get_user_full_by_token(token)
+    if not u:
+        return jsonify({'success': False, 'messages': []})
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM group_members WHERE chat_id = ? AND user_id = ?",
+              (chat_id, u['id']))
+    if not c.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'Нет доступа', 'messages': []}), 403
+
+    c.execute("""SELECT id, nickname, text, created_at
+                 FROM group_messages
+                 WHERE chat_id = ?
+                 ORDER BY id DESC
+                 LIMIT 100""", (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+
+    msgs = [{'id': r['id'], 'nickname': r['nickname'], 'text': r['text'],
+             'created_at': r['created_at']} for r in rows]
+    msgs.reverse()
+    return jsonify({'success': True, 'messages': msgs})
 
 
 init_db()
