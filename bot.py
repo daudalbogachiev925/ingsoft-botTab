@@ -75,6 +75,7 @@ def init_db():
         ('avatar_data', 'TEXT'),
         ('referrer_nickname', 'TEXT'),
         ('referrer_id', 'INTEGER'),
+        ('role', "TEXT DEFAULT 'user'"),
     ]:
         try:
             c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
@@ -263,6 +264,42 @@ def save_progress():
     return jsonify({'ok': True})
 
 
+@app.route('/claim-quest', methods=['POST'])
+def claim_quest():
+    data = request.get_json() or {}
+    token = data.get('token')
+    quest_id = data.get('quest_id')
+    reward = int(data.get('reward', 0))
+    if not token or not quest_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT claimed_quests, score FROM users WHERE token = ?", (token,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'error': 'user not found'}), 401
+
+    try:
+        claimed = json.loads(row['claimed_quests'] or '[]')
+    except Exception:
+        claimed = []
+
+    if quest_id in claimed:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Уже забрано'}), 400
+
+    claimed.append(quest_id)
+    new_score = (row['score'] or 0) + reward
+
+    c.execute("UPDATE users SET claimed_quests = ?, score = ? WHERE token = ?",
+              (json.dumps(claimed), new_score, token))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'new_score': new_score, 'claimed': claimed})
+
+
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.get_json() or {}
@@ -367,6 +404,27 @@ def claim_referral():
     return jsonify({'success': True})
 
 
+@app.route('/give-referral-reward', methods=['POST'])
+def give_referral_reward():
+    data = request.get_json() or {}
+    referrer_nick = data.get('referrer_nickname')
+    new_user_token = data.get('new_user_token')
+    amount = int(data.get('amount', 500))
+
+    if not referrer_nick or not new_user_token:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_balance = is_balance + ? WHERE nickname = ?",
+              (amount, referrer_nick))
+    c.execute("UPDATE users SET is_balance = is_balance + ? WHERE token = ?",
+              (amount, new_user_token))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
 @app.route('/check-sub', methods=['GET'])
 def check_sub():
     return jsonify({'subscribed': True})
@@ -379,6 +437,15 @@ def _get_user_by_token(token):
     u = c.fetchone()
     conn.close()
     return u
+
+
+def _is_admin(token):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE token = ?", (token,))
+    row = c.fetchone()
+    conn.close()
+    return row and row['role'] == 'admin'
 
 
 @app.route('/send-message', methods=['POST'])
@@ -464,6 +531,86 @@ def get_messages():
         print("[get-messages ERROR]", e)
         traceback.print_exc()
         return jsonify({'success': False, 'error': 'Ошибка сервера', 'messages': []}), 500
+
+
+@app.route('/delete-message', methods=['POST'])
+def delete_message():
+    data = request.get_json() or {}
+    token = data.get('token')
+    msg_id = data.get('message_id')
+    if not token or not msg_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if not _is_admin(token):
+        return jsonify({'success': False, 'error': 'Только для админов'}), 403
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/edit-message', methods=['POST'])
+def edit_message():
+    data = request.get_json() or {}
+    token = data.get('token')
+    msg_id = data.get('message_id')
+    new_text = (data.get('text') or '').strip()
+    if not token or not msg_id or not new_text:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if not _is_admin(token):
+        return jsonify({'success': False, 'error': 'Только для админов'}), 403
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE messages SET text = ? WHERE id = ?", (new_text, msg_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/pin-message', methods=['POST'])
+def pin_message():
+    data = request.get_json() or {}
+    token = data.get('token')
+    msg_id = data.get('message_id')
+    if not token or not msg_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if not _is_admin(token):
+        return jsonify({'success': False, 'error': 'Только для админов'}), 403
+    return jsonify({'success': True})
+
+
+@app.route('/chat-stats', methods=['GET'])
+def chat_stats():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'success': False}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users WHERE nickname IS NOT NULL AND nickname != ''")
+    total_players = c.fetchone()[0]
+    c.execute("SELECT COUNT(DISTINCT user_id) FROM messages")
+    unique_chatters = c.fetchone()[0]
+    now_ms = int(time.time() * 1000)
+    c.execute("SELECT COUNT(*) FROM users WHERE last_seen > ?", (now_ms - ONLINE_WINDOW_MS,))
+    online_now = c.fetchone()[0]
+    c.execute("""SELECT nickname, MAX(created_at) as last_time
+                 FROM messages
+                 GROUP BY user_id
+                 ORDER BY last_time DESC
+                 LIMIT 50""")
+    history = [{'nickname': r['nickname'], 'last_time': r['last_time']} for r in c.fetchall()]
+    conn.close()
+    return jsonify({
+        'success': True,
+        'total_players': total_players,
+        'unique_chatters': unique_chatters,
+        'online_now': online_now,
+        'history': history
+    })
 
 
 init_db()
