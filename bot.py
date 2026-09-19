@@ -165,7 +165,6 @@ def register():
     ref_nick = data.get('referrer_nickname')
     ref_id = data.get('referrer_id')
 
-    # Нормализуем referrer_id
     if ref_id:
         try:
             ref_id = int(ref_id)
@@ -198,16 +197,51 @@ def register():
         conn.commit()
         new_user_id = c.lastrowid
 
-        # Если пришёл ref_id — проверим, что такой игрок есть, и запишем ник
+        referrer_found = None
         if ref_id:
             c.execute("SELECT id, nickname FROM users WHERE id = ?", (ref_id,))
-            referrer = c.fetchone()
-            if referrer:
+            referrer_found = c.fetchone()
+            if referrer_found:
                 c.execute("UPDATE users SET referrer_nickname = ? WHERE id = ?",
-                          (referrer['nickname'], new_user_id))
+                          (referrer_found['nickname'], new_user_id))
                 conn.commit()
 
-        return jsonify({'ok': True})
+        if not referrer_found and ref_nick:
+            c.execute("SELECT id, nickname FROM users WHERE nickname = ?", (ref_nick,))
+            referrer_found = c.fetchone()
+
+        reward = 0
+        if referrer_found:
+            c.execute("""SELECT COUNT(*) FROM users
+                         WHERE referrer_id = ? OR referrer_nickname = ?""",
+                      (referrer_found['id'], referrer_found['nickname']))
+            ref_count = c.fetchone()[0] or 0
+
+            if ref_count <= 0:
+                reward = 0
+            elif ref_count == 1:
+                reward = 100
+            elif ref_count == 2:
+                reward = 150
+            elif 3 <= ref_count <= 4:
+                reward = 150
+            elif ref_count == 5:
+                reward = 450
+            elif 6 <= ref_count <= 100:
+                reward = 100
+            else:
+                reward = 300
+
+            if reward > 0:
+                c.execute("UPDATE users SET is_balance = is_balance + ? WHERE id = ?",
+                          (reward, referrer_found['id']))
+                conn.commit()
+
+        return jsonify({
+            'ok': True,
+            'referrer': referrer_found['nickname'] if referrer_found else None,
+            'reward': reward
+        })
     except sqlite3.IntegrityError:
         return jsonify({'error': 'Логин уже занят'}), 400
     finally:
@@ -442,6 +476,47 @@ def my_id():
     if not row:
         return jsonify({'success': False}), 401
     return jsonify({'success': True, 'id': row['id'], 'nickname': row['nickname']})
+
+@app.route('/referrals/check-new', methods=['GET'])
+def referrals_check_new():
+    token = request.args.get('token')
+    since_id = request.args.get('since_id', 0)
+    try:
+        since_id = int(since_id)
+    except Exception:
+        since_id = 0
+
+    if not token:
+        return jsonify({'success': False, 'new': [], 'count': 0})
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, nickname FROM users WHERE token = ?", (token,))
+    me = c.fetchone()
+    if not me:
+        conn.close()
+        return jsonify({'success': False, 'new': [], 'count': 0})
+
+    c.execute("""SELECT id, nickname FROM users
+                 WHERE (referrer_id = ? OR referrer_nickname = ?)
+                   AND id > ?
+                 ORDER BY id ASC""",
+              (me['id'], me['nickname'], since_id))
+    rows = c.fetchall()
+
+    c.execute("""SELECT COUNT(*) FROM users
+                 WHERE referrer_id = ? OR referrer_nickname = ?""",
+              (me['id'], me['nickname']))
+    total = c.fetchone()[0] or 0
+
+    conn.close()
+    new_list = [{'id': r['id'], 'nickname': r['nickname']} for r in rows]
+    return jsonify({
+        'success': True,
+        'new': new_list,
+        'count': total,
+        'max_id': new_list[-1]['id'] if new_list else since_id
+    })
 
 
 @app.route('/my-referrals', methods=['GET'])
