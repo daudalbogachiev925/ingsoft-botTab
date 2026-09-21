@@ -151,6 +151,31 @@ def generate_token():
     return secrets.token_urlsafe(32)
 
 
+def compute_referral_reward(ref_count):
+    """
+    Таблица наград за рефералов (по количеству УЖЕ приглашённых, включая нового):
+      1        -> 100
+      2        -> 150
+      3..4     -> 150
+      5        -> 450
+      6..100   -> 100
+      >100     -> 300
+    """
+    if ref_count <= 0:
+        return 0
+    if ref_count == 1:
+        return 100
+    if ref_count == 2:
+        return 150
+    if 3 <= ref_count <= 4:
+        return 150
+    if ref_count == 5:
+        return 450
+    if 6 <= ref_count <= 100:
+        return 100
+    return 300
+
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
@@ -183,6 +208,7 @@ def register():
     conn = get_db()
     c = conn.cursor()
     try:
+        # 1) Сначала вставляем нового пользователя
         c.execute("""
             INSERT INTO users
               (login, password, nickname, gender, phone, region, full_name,
@@ -197,6 +223,7 @@ def register():
         conn.commit()
         new_user_id = c.lastrowid
 
+        # 2) Ищем пригласившего — сначала по id, потом по нику
         referrer_found = None
         if ref_id:
             c.execute("SELECT id, nickname FROM users WHERE id = ?", (ref_id,))
@@ -210,6 +237,7 @@ def register():
             c.execute("SELECT id, nickname FROM users WHERE nickname = ?", (ref_nick,))
             referrer_found = c.fetchone()
 
+        # 3) Считаем награду УЖЕ с учётом нового пользователя
         reward = 0
         if referrer_found:
             c.execute("""SELECT COUNT(*) FROM users
@@ -217,20 +245,7 @@ def register():
                       (referrer_found['id'], referrer_found['nickname']))
             ref_count = c.fetchone()[0] or 0
 
-            if ref_count <= 0:
-                reward = 0
-            elif ref_count == 1:
-                reward = 100
-            elif ref_count == 2:
-                reward = 150
-            elif 3 <= ref_count <= 4:
-                reward = 150
-            elif ref_count == 5:
-                reward = 450
-            elif 6 <= ref_count <= 100:
-                reward = 100
-            else:
-                reward = 300
+            reward = compute_referral_reward(ref_count)
 
             if reward > 0:
                 c.execute("UPDATE users SET is_balance = is_balance + ? WHERE id = ?",
@@ -240,6 +255,7 @@ def register():
         return jsonify({
             'ok': True,
             'referrer': referrer_found['nickname'] if referrer_found else None,
+            'referrer_id': referrer_found['id'] if referrer_found else None,
             'reward': reward
         })
     except sqlite3.IntegrityError:
@@ -477,6 +493,7 @@ def my_id():
         return jsonify({'success': False}), 401
     return jsonify({'success': True, 'id': row['id'], 'nickname': row['nickname']})
 
+
 @app.route('/referrals/check-new', methods=['GET'])
 def referrals_check_new():
     token = request.args.get('token')
@@ -534,7 +551,6 @@ def my_referrals():
         return jsonify({'success': False, 'referrals': []})
 
     my_id = me['id']
-    # Ищем по referrer_id (числовой), а старые по нику оставляем для совместимости
     c.execute("""SELECT nickname FROM users
                  WHERE referrer_id = ? OR referrer_nickname = ?
                  ORDER BY id ASC""",
