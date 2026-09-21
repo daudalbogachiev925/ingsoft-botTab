@@ -65,6 +65,7 @@ def init_db():
             avatar_data TEXT,
             referrer_nickname TEXT,
             referrer_id INTEGER,
+            referral_seen_id INTEGER DEFAULT 0,
             last_seen INTEGER DEFAULT 0,
             created_at INTEGER
         )
@@ -76,6 +77,7 @@ def init_db():
         ('referrer_nickname', 'TEXT'),
         ('referrer_id', 'INTEGER'),
         ('role', "TEXT DEFAULT 'user'"),
+        ('referral_seen_id', 'INTEGER DEFAULT 0'),
     ]:
         try:
             c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
@@ -152,15 +154,6 @@ def generate_token():
 
 
 def compute_referral_reward(ref_count):
-    """
-    Таблица наград за рефералов (по количеству УЖЕ приглашённых, включая нового):
-      1        -> 100
-      2        -> 150
-      3..4     -> 150
-      5        -> 450
-      6..100   -> 100
-      >100     -> 300
-    """
     if ref_count <= 0:
         return 0
     if ref_count == 1:
@@ -208,7 +201,6 @@ def register():
     conn = get_db()
     c = conn.cursor()
     try:
-        # 1) Сначала вставляем нового пользователя
         c.execute("""
             INSERT INTO users
               (login, password, nickname, gender, phone, region, full_name,
@@ -223,7 +215,6 @@ def register():
         conn.commit()
         new_user_id = c.lastrowid
 
-        # 2) Ищем пригласившего — сначала по id, потом по нику
         referrer_found = None
         if ref_id:
             c.execute("SELECT id, nickname FROM users WHERE id = ?", (ref_id,))
@@ -237,14 +228,12 @@ def register():
             c.execute("SELECT id, nickname FROM users WHERE nickname = ?", (ref_nick,))
             referrer_found = c.fetchone()
 
-        # 3) Считаем награду УЖЕ с учётом нового пользователя
         reward = 0
         if referrer_found:
             c.execute("""SELECT COUNT(*) FROM users
                          WHERE referrer_id = ? OR referrer_nickname = ?""",
                       (referrer_found['id'], referrer_found['nickname']))
             ref_count = c.fetchone()[0] or 0
-
             reward = compute_referral_reward(ref_count)
 
             if reward > 0:
@@ -492,6 +481,66 @@ def my_id():
     if not row:
         return jsonify({'success': False}), 401
     return jsonify({'success': True, 'id': row['id'], 'nickname': row['nickname']})
+
+
+@app.route('/referrals/pending', methods=['GET'])
+def referrals_pending():
+    """
+    Возвращает список рефералов, о которых юзер ещё не получал уведомление.
+    Фронт вызывает при входе и каждые 10 сек.
+    """
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'success': False, 'pending': [], 'my_id': None})
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, nickname, referral_seen_id FROM users WHERE token = ?", (token,))
+    me = c.fetchone()
+    if not me:
+        conn.close()
+        return jsonify({'success': False, 'pending': [], 'my_id': None})
+
+    seen_id = me['referral_seen_id'] or 0
+
+    c.execute("""SELECT id, nickname FROM users
+                 WHERE (referrer_id = ? OR referrer_nickname = ?)
+                   AND id > ?
+                 ORDER BY id ASC""",
+              (me['id'], me['nickname'], seen_id))
+    rows = c.fetchall()
+    conn.close()
+
+    pending = [{'id': r['id'], 'nickname': r['nickname']} for r in rows]
+
+    return jsonify({
+        'success': True,
+        'pending': pending,
+        'count': len(pending),
+        'my_id': me['id']
+    })
+
+
+@app.route('/referrals/mark-seen', methods=['POST'])
+def referrals_mark_seen():
+    """Отмечает рефералов как просмотренные до last_id включительно."""
+    data = request.get_json() or {}
+    token = data.get('token')
+    last_id = int(data.get('last_id', 0))
+    if not token or last_id <= 0:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""UPDATE users
+                 SET referral_seen_id = CASE
+                     WHEN referral_seen_id IS NULL OR referral_seen_id < ? THEN ?
+                     ELSE referral_seen_id
+                 END
+                 WHERE token = ?""", (last_id, last_id, token))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
 
 
 @app.route('/referrals/check-new', methods=['GET'])
