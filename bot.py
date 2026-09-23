@@ -54,6 +54,12 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS group_messages (
         id SERIAL PRIMARY KEY, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
         nickname TEXT NOT NULL, text TEXT NOT NULL, created_at BIGINT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS game_bets (
+        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, nickname TEXT NOT NULL,
+        game_id TEXT NOT NULL, bet BIGINT NOT NULL, win BOOLEAN NOT NULL,
+        payout BIGINT NOT NULL, multiplier REAL NOT NULL, created_at BIGINT NOT NULL)""")
+    try: c.execute("CREATE INDEX IF NOT EXISTS idx_game_bets_created ON game_bets(created_at DESC)")
+    except: conn.rollback()
     conn.commit(); conn.close(); print("[DB] init done")
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
@@ -633,6 +639,115 @@ def groups_rename():
     if ch['owner_id']!=u['id']: conn.close(); return jsonify({'success':False,'error':'Только владелец'}),403
     c.execute("UPDATE group_chats SET name=%s WHERE id=%s",(nn,cid))
     conn.commit(); conn.close(); return jsonify({'success':True,'name':nn})
+
+# ==================== ИГРЫ / СТАВКИ ====================
+GAME_CONFIG = {
+    'roulette': {'win_chance': 0.48, 'multiplier': 2.0,  'name': 'Рулетка'},
+    'dice':     {'win_chance': 0.45, 'multiplier': 2.2,  'name': 'Кубик'},
+    'coin':     {'win_chance': 0.50, 'multiplier': 1.9,  'name': 'Монетка'},
+    'slots':    {'win_chance': 0.30, 'multiplier': 3.0,  'name': 'Слоты'},
+    'basket':   {'win_chance': 0.40, 'multiplier': 2.4,  'name': 'Баскетбол'},
+    'mine':     {'win_chance': 0.35, 'multiplier': 2.8,  'name': 'Майнинг'},
+    'wheel':    {'win_chance': 0.42, 'multiplier': 2.3,  'name': 'Колесо'},
+    'darts':    {'win_chance': 0.38, 'multiplier': 2.5,  'name': 'Дартс'},
+    'fishing':  {'win_chance': 0.44, 'multiplier': 2.2,  'name': 'Рыбалка'},
+    'cards':    {'win_chance': 0.40, 'multiplier': 2.4,  'name': 'Карты'},
+    'shells':   {'win_chance': 0.33, 'multiplier': 2.9,  'name': 'Фокусник'},
+    'craps':    {'win_chance': 0.37, 'multiplier': 2.6,  'name': 'Кости'},
+    'archery':  {'win_chance': 0.36, 'multiplier': 2.7,  'name': 'Лучник'},
+    'penalty':  {'win_chance': 0.42, 'multiplier': 2.3,  'name': 'Пенальти'},
+    'basket3':  {'win_chance': 0.28, 'multiplier': 3.3,  'name': '3-очковый'},
+    'mines':    {'win_chance': 0.32, 'multiplier': 3.1,  'name': 'Сапёр'},
+}
+MIN_BET = 1000
+MAX_BET = 1000000
+
+@app.route('/games/list', methods=['GET'])
+def games_list():
+    return jsonify({'success': True, 'games': [
+        {'id': k, 'name': v['name'], 'win_chance': v['win_chance'],
+         'multiplier': v['multiplier'], 'min_bet': MIN_BET, 'max_bet': MAX_BET}
+        for k, v in GAME_CONFIG.items()
+    ]})
+
+@app.route('/games/play', methods=['POST'])
+def games_play():
+    d = request.get_json() or {}
+    token = d.get('token')
+    game_id = (d.get('game_id') or '').strip()
+    try:
+        bet = int(d.get('bet', 0))
+    except:
+        return jsonify({'success': False, 'error': 'Некорректная ставка'}), 400
+
+    if not token or not game_id:
+        return jsonify({'success': False, 'error': 'bad params'}), 400
+    if game_id not in GAME_CONFIG:
+        return jsonify({'success': False, 'error': 'Игра не найдена'}), 404
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({'success': False, 'error': f'Ставка от {MIN_BET} до {MAX_BET}'}), 400
+
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT id, nickname, score FROM users WHERE token=%s", (token,))
+    u = c.fetchone()
+    if not u:
+        conn.close(); return jsonify({'success': False, 'error': 'Игрок не найден'}), 401
+
+    current_score = u['score'] or 0
+    if current_score < bet:
+        conn.close(); return jsonify({'success': False, 'error': 'Недостаточно очков', 'score': current_score}), 400
+
+    cfg = GAME_CONFIG[game_id]
+    win = secrets.randbelow(10000) < int(cfg['win_chance'] * 10000)
+
+    if win:
+        payout = int(bet * cfg['multiplier'])
+        new_score = current_score - bet + payout
+    else:
+        payout = 0
+        new_score = current_score - bet
+
+    if new_score < 0:
+        new_score = 0
+
+    c.execute("UPDATE users SET score=%s, last_seen=%s WHERE id=%s",
+              (new_score, int(time.time()*1000), u['id']))
+    c.execute("""INSERT INTO game_bets (user_id, nickname, game_id, bet, win, payout, multiplier, created_at)
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+              (u['id'], u['nickname'], game_id, bet, win, payout, cfg['multiplier'], int(time.time()*1000)))
+    conn.commit(); conn.close()
+
+    return jsonify({
+        'success': True, 'win': win, 'bet': bet, 'payout': payout,
+        'new_score': new_score, 'multiplier': cfg['multiplier'],
+        'game_id': game_id, 'game_name': cfg['name']
+    })
+
+@app.route('/games/history', methods=['GET'])
+def games_history():
+    token = request.args.get('token')
+    limit = max(1, min(int(request.args.get('limit', 20)), 50))
+    if not token:
+        return jsonify({'success': False, 'bets': []})
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT id FROM users WHERE token=%s", (token,))
+    u = c.fetchone()
+    if not u:
+        conn.close(); return jsonify({'success': False, 'bets': []})
+    c.execute("""SELECT game_id, bet, win, payout, multiplier, created_at
+                 FROM game_bets WHERE user_id=%s ORDER BY id DESC LIMIT %s""",
+              (u['id'], limit))
+    rows = c.fetchall(); conn.close()
+    return jsonify({'success': True, 'bets': [dict(r) for r in rows]})
+
+@app.route('/games/top-wins', methods=['GET'])
+def games_top_wins():
+    limit = max(1, min(int(request.args.get('limit', 10)), 20))
+    conn = get_db(); c = cur(conn)
+    c.execute("""SELECT nickname, game_id, bet, payout, multiplier, created_at
+                 FROM game_bets WHERE win=TRUE ORDER BY payout DESC LIMIT %s""", (limit,))
+    rows = c.fetchall(); conn.close()
+    return jsonify({'success': True, 'wins': [dict(r) for r in rows]})
 
 @app.route('/')
 def index(): return jsonify({'status':'ok','message':'IngSoft API v2'})
