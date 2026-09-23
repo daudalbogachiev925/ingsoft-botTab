@@ -3,11 +3,21 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 CORS(app)
 DB_CONFIG = {'host':'localhost','database':'ingsoft_db','user':'ingsoft_user','password':'IngSoft2026!'}
 ONLINE_WINDOW_MS = 5*60*1000
+
+# ==================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ====================
+@app.errorhandler(Exception)
+def handle_exception(e):
+    if isinstance(e, HTTPException):
+        return e
+    print(f"[GLOBAL ERROR] {e}")
+    traceback.print_exc()
+    return jsonify({'success': False, 'error': 'Внутренняя ошибка сервера'}), 500
 
 def get_db(): return psycopg2.connect(**DB_CONFIG)
 def cur(conn): return conn.cursor(cursor_factory=RealDictCursor)
@@ -682,56 +692,68 @@ def games_list():
 
 @app.route('/games/play', methods=['POST'])
 def games_play():
-    d = request.get_json() or {}
-    token = d.get('token')
-    game_id = (d.get('game_id') or '').strip()
     try:
-        bet = int(d.get('bet', 0))
-    except:
-        return jsonify({'success': False, 'error': 'Некорректная ставка'}), 400
+        d = request.get_json() or {}
+        token = d.get('token')
+        game_id = (d.get('game_id') or '').strip()
+        try:
+            bet = int(d.get('bet', 0))
+        except:
+            return jsonify({'success': False, 'error': 'Некорректная ставка'}), 400
 
-    if not token or not game_id:
-        return jsonify({'success': False, 'error': 'bad params'}), 400
-    if game_id not in GAME_CONFIG:
-        return jsonify({'success': False, 'error': 'Игра не найдена'}), 404
-    if bet < MIN_BET or bet > MAX_BET:
-        return jsonify({'success': False, 'error': f'Ставка от {MIN_BET} до {MAX_BET}'}), 400
+        if not token or not game_id:
+            return jsonify({'success': False, 'error': 'bad params'}), 400
+        if game_id not in GAME_CONFIG:
+            return jsonify({'success': False, 'error': 'Игра не найдена'}), 404
+        if bet < MIN_BET or bet > MAX_BET:
+            return jsonify({'success': False, 'error': f'Ставка от {MIN_BET} до {MAX_BET}'}), 400
 
-    conn = get_db(); c = cur(conn)
-    c.execute("SELECT id, nickname, score FROM users WHERE token=%s", (token,))
-    u = c.fetchone()
-    if not u:
-        conn.close(); return jsonify({'success': False, 'error': 'Игрок не найден'}), 401
+        conn = get_db(); c = cur(conn)
+        c.execute("SELECT id, nickname, score FROM users WHERE token=%s", (token,))
+        u = c.fetchone()
+        if not u:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Игрок не найден'}), 401
 
-    current_score = u['score'] or 0
-    if current_score < bet:
-        conn.close(); return jsonify({'success': False, 'error': 'Недостаточно очков', 'score': current_score}), 400
+        current_score = u['score'] or 0
+        if current_score < bet:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Недостаточно очков', 'score': current_score}), 400
 
-    cfg = GAME_CONFIG[game_id]
-    win = secrets.randbelow(10000) < int(cfg['win_chance'] * 10000)
+        cfg = GAME_CONFIG[game_id]
+        win = secrets.randbelow(10000) < int(cfg['win_chance'] * 10000)
 
-    if win:
-        payout = int(bet * cfg['multiplier'])
-        new_score = current_score - bet + payout
-    else:
-        payout = 0
-        new_score = current_score - bet
+        if win:
+            payout = int(bet * cfg['multiplier'])
+            new_score = current_score - bet + payout
+        else:
+            payout = 0
+            new_score = current_score - bet
 
-    if new_score < 0:
-        new_score = 0
+        if new_score < 0:
+            new_score = 0
 
-    c.execute("UPDATE users SET score=%s, last_seen=%s WHERE id=%s",
-              (new_score, int(time.time()*1000), u['id']))
-    c.execute("""INSERT INTO game_bets (user_id, nickname, game_id, bet, win, payout, multiplier, created_at)
-                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-              (u['id'], u['nickname'], game_id, bet, win, payout, cfg['multiplier'], int(time.time()*1000)))
-    conn.commit(); conn.close()
+        c.execute("UPDATE users SET score=%s, last_seen=%s WHERE id=%s",
+                  (new_score, int(time.time()*1000), u['id']))
+        c.execute("""INSERT INTO game_bets (user_id, nickname, game_id, bet, win, payout, multiplier, created_at)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  (u['id'], u['nickname'], game_id, bet, win, payout, cfg['multiplier'], int(time.time()*1000)))
+        conn.commit()
+        conn.close()
 
-    return jsonify({
-        'success': True, 'win': win, 'bet': bet, 'payout': payout,
-        'new_score': new_score, 'multiplier': cfg['multiplier'],
-        'game_id': game_id, 'game_name': cfg['name']
-    })
+        return jsonify({
+            'success': True, 'win': win, 'bet': bet, 'payout': payout,
+            'new_score': new_score, 'multiplier': cfg['multiplier'],
+            'game_id': game_id, 'game_name': cfg['name']
+        })
+    except psycopg2.Error as db_err:
+        print(f"[games/play DB ERROR] {db_err}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': 'Ошибка базы данных'}), 500
+    except Exception as e:
+        print(f"[games/play ERROR] {e}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': 'Внутренняя ошибка сервера'}), 500
 
 @app.route('/games/history', methods=['GET'])
 def games_history():
