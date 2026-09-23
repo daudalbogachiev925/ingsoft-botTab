@@ -236,6 +236,16 @@ def my_id():
     if not row: return jsonify({'success':False}),401
     return jsonify({'success':True,'id':row['id'],'nickname':row['nickname']})
 
+@app.route('/my-balance', methods=['GET'])
+def my_balance():
+    token=request.args.get('token')
+    if not token: return jsonify({'success':False,'is_balance':0})
+    conn=get_db(); c=cur(conn)
+    c.execute("SELECT is_balance FROM users WHERE token=%s",(token,))
+    row=c.fetchone(); conn.close()
+    if not row: return jsonify({'success':False,'is_balance':0})
+    return jsonify({'success':True,'is_balance':row['is_balance'] or 0})
+
 @app.route('/referrals/pending', methods=['GET'])
 def referrals_pending():
     token=request.args.get('token')
@@ -265,15 +275,15 @@ def referrals_mark_seen():
 @app.route('/my-referrals', methods=['GET'])
 def my_referrals():
     token=request.args.get('token')
-    if not token: return jsonify({'success':False,'referrals':[]})
+    if not token: return jsonify({'success':False,'referrals':[],'count':0})
     conn=get_db(); c=cur(conn)
     c.execute("SELECT id,nickname FROM users WHERE token=%s",(token,))
     me=c.fetchone()
-    if not me: conn.close(); return jsonify({'success':False,'referrals':[]})
+    if not me: conn.close(); return jsonify({'success':False,'referrals':[],'count':0})
     c.execute("""SELECT nickname FROM users WHERE referrer_id=%s OR referrer_nickname=%s
         ORDER BY id ASC""",(me['id'],me['nickname']))
     refs=[{'nickname':r['nickname']} for r in c.fetchall()]
-    conn.close(); return jsonify({'success':True,'referrals':refs})
+    conn.close(); return jsonify({'success':True,'referrals':refs,'count':len(refs)})
 
 @app.route('/claim-referral', methods=['POST'])
 def claim_referral():
