@@ -662,22 +662,22 @@ def groups_rename():
 
 # ==================== ИГРЫ / СТАВКИ ====================
 GAME_CONFIG = {
-    'roulette': {'win_chance': 0.48, 'multiplier': 2.0,  'name': 'Рулетка'},
-    'dice':     {'win_chance': 0.45, 'multiplier': 2.2,  'name': 'Кубик'},
-    'coin':     {'win_chance': 0.50, 'multiplier': 1.9,  'name': 'Монетка'},
-    'slots':    {'win_chance': 0.30, 'multiplier': 3.0,  'name': 'Слоты'},
-    'basket':   {'win_chance': 0.40, 'multiplier': 2.4,  'name': 'Баскетбол'},
-    'mine':     {'win_chance': 0.35, 'multiplier': 2.8,  'name': 'Майнинг'},
-    'wheel':    {'win_chance': 0.42, 'multiplier': 2.3,  'name': 'Колесо'},
-    'darts':    {'win_chance': 0.38, 'multiplier': 2.5,  'name': 'Дартс'},
-    'fishing':  {'win_chance': 0.44, 'multiplier': 2.2,  'name': 'Рыбалка'},
-    'cards':    {'win_chance': 0.40, 'multiplier': 2.4,  'name': 'Карты'},
-    'shells':   {'win_chance': 0.33, 'multiplier': 2.9,  'name': 'Фокусник'},
-    'craps':    {'win_chance': 0.37, 'multiplier': 2.6,  'name': 'Кости'},
-    'archery':  {'win_chance': 0.36, 'multiplier': 2.7,  'name': 'Лучник'},
-    'penalty':  {'win_chance': 0.42, 'multiplier': 2.3,  'name': 'Пенальти'},
-    'basket3':  {'win_chance': 0.28, 'multiplier': 3.3,  'name': '3-очковый'},
-    'mines':    {'win_chance': 0.32, 'multiplier': 3.1,  'name': 'Сапёр'},
+    'roulette': {'win_chance': 0.30, 'multiplier': 2.0,  'name': 'Рулетка'},
+    'dice':     {'win_chance': 0.30, 'multiplier': 2.2,  'name': 'Кубик'},
+    'coin':     {'win_chance': 0.30, 'multiplier': 1.9,  'name': 'Монетка'},
+    'slots':    {'win_chance': 0.25, 'multiplier': 3.0,  'name': 'Слоты'},
+    'basket':   {'win_chance': 0.30, 'multiplier': 2.4,  'name': 'Баскетбол'},
+    'mine':     {'win_chance': 0.30, 'multiplier': 2.8,  'name': 'Майнинг'},
+    'wheel':    {'win_chance': 0.30, 'multiplier': 2.3,  'name': 'Колесо'},
+    'darts':    {'win_chance': 0.30, 'multiplier': 2.5,  'name': 'Дартс'},
+    'fishing':  {'win_chance': 0.30, 'multiplier': 2.2,  'name': 'Рыбалка'},
+    'cards':    {'win_chance': 0.30, 'multiplier': 2.4,  'name': 'Карты'},
+    'shells':   {'win_chance': 0.30, 'multiplier': 2.9,  'name': 'Фокусник'},
+    'craps':    {'win_chance': 0.30, 'multiplier': 2.6,  'name': 'Кости'},
+    'archery':  {'win_chance': 0.30, 'multiplier': 2.7,  'name': 'Лучник'},
+    'penalty':  {'win_chance': 0.30, 'multiplier': 2.3,  'name': 'Пенальти'},
+    'basket3':  {'win_chance': 0.25, 'multiplier': 3.3,  'name': '3-очковый'},
+    'mines':    {'win_chance': 0.30, 'multiplier': 3.1,  'name': 'Сапёр'},
 }
 MIN_BET = 1000
 MAX_BET = 1000000
@@ -721,7 +721,8 @@ def games_play():
             return jsonify({'success': False, 'error': 'Недостаточно очков', 'score': current_score}), 400
 
         cfg = GAME_CONFIG[game_id]
-        win = secrets.randbelow(10000) < int(cfg['win_chance'] * 10000)
+# Реальная 30/70 — 70% проигрыш
+win = secrets.randbelow(100) < 30
 
         if win:
             payout = int(bet * cfg['multiplier'])
