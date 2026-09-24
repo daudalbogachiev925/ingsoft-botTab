@@ -10,7 +10,6 @@ CORS(app)
 DB_CONFIG = {'host':'localhost','database':'ingsoft_db','user':'ingsoft_user','password':'IngSoft2026!'}
 ONLINE_WINDOW_MS = 5*60*1000
 
-# ==================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ====================
 @app.errorhandler(Exception)
 def handle_exception(e):
     if isinstance(e, HTTPException):
@@ -662,25 +661,22 @@ def groups_rename():
 
 # ==================== ИГРЫ / СТАВКИ ====================
 GAME_CONFIG = {
-    'roulette': {'win_chance': 0.30, 'multiplier': 2.0,  'name': 'Рулетка'},
-    'dice':     {'win_chance': 0.30, 'multiplier': 2.2,  'name': 'Кубик'},
+    'dice':     {'win_chance': 0.30, 'multiplier': 2.2,  'name': 'Кости'},
     'coin':     {'win_chance': 0.30, 'multiplier': 1.9,  'name': 'Монетка'},
     'slots':    {'win_chance': 0.25, 'multiplier': 3.0,  'name': 'Слоты'},
     'basket':   {'win_chance': 0.30, 'multiplier': 2.4,  'name': 'Баскетбол'},
     'mine':     {'win_chance': 0.30, 'multiplier': 2.8,  'name': 'Майнинг'},
-    'wheel':    {'win_chance': 0.30, 'multiplier': 2.3,  'name': 'Колесо'},
+    'wheel':    {'win_chance': 0.30, 'multiplier': 2.3,  'name': 'Колесо Фортуны'},
     'darts':    {'win_chance': 0.30, 'multiplier': 2.5,  'name': 'Дартс'},
     'fishing':  {'win_chance': 0.30, 'multiplier': 2.2,  'name': 'Рыбалка'},
     'cards':    {'win_chance': 0.30, 'multiplier': 2.4,  'name': 'Карты'},
     'shells':   {'win_chance': 0.30, 'multiplier': 2.9,  'name': 'Фокусник'},
-    'craps':    {'win_chance': 0.30, 'multiplier': 2.6,  'name': 'Кости'},
-    'archery':  {'win_chance': 0.30, 'multiplier': 2.7,  'name': 'Лучник'},
     'penalty':  {'win_chance': 0.30, 'multiplier': 2.3,  'name': 'Пенальти'},
-    'basket3':  {'win_chance': 0.25, 'multiplier': 3.3,  'name': '3-очковый'},
     'mines':    {'win_chance': 0.30, 'multiplier': 3.1,  'name': 'Сапёр'},
 }
+
 MIN_BET = 1000
-MAX_BET = 1000000
+MAX_BET = 999999999999999  # без лимита сверху
 
 @app.route('/games/list', methods=['GET'])
 def games_list():
@@ -705,8 +701,8 @@ def games_play():
             return jsonify({'success': False, 'error': 'bad params'}), 400
         if game_id not in GAME_CONFIG:
             return jsonify({'success': False, 'error': 'Игра не найдена'}), 404
-        if bet < MIN_BET or bet > MAX_BET:
-            return jsonify({'success': False, 'error': f'Ставка от {MIN_BET} до {MAX_BET}'}), 400
+        if bet < MIN_BET:
+            return jsonify({'success': False, 'error': f'Минимальная ставка {MIN_BET}'}), 400
 
         conn = get_db(); c = cur(conn)
         c.execute("SELECT id, nickname, score FROM users WHERE token=%s", (token,))
@@ -721,8 +717,7 @@ def games_play():
             return jsonify({'success': False, 'error': 'Недостаточно очков', 'score': current_score}), 400
 
         cfg = GAME_CONFIG[game_id]
-# Реальная 30/70 — 70% проигрыш
-win = secrets.randbelow(100) < 30
+        win = secrets.randbelow(100) < int(cfg['win_chance'] * 100)
 
         if win:
             payout = int(bet * cfg['multiplier'])
