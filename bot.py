@@ -75,13 +75,16 @@ def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 def generate_token(): return secrets.token_urlsafe(32)
 
 def compute_referral_reward(n):
-    if n<=0: return 0
-    if n==1: return 100
-    if n==2: return 150
-    if 3<=n<=4: return 150
-    if n==5: return 450
-    if 6<=n<=100: return 100
-    return 300
+    """Сколько ВСЕГО IS начислено за N друзей."""
+    if n <= 0: return 0
+    if n <= 100: return n * 100
+    return 100 * 100 + (n - 100) * 450
+
+def per_referral_reward(n):
+    """Сколько IS за N-го друга."""
+    if n <= 0: return 0
+    if n <= 100: return 100
+    return 450
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -123,7 +126,7 @@ def register():
             c.execute("SELECT COUNT(*) as cnt FROM users WHERE referrer_id=%s OR referrer_nickname=%s",
                 (ref['id'],ref['nickname']))
             ref_count=c.fetchone()['cnt'] or 0
-            reward=compute_referral_reward(ref_count)
+            reward=per_referral_reward(ref_count)
             if reward>0:
                 c.execute("UPDATE users SET is_balance=is_balance+%s WHERE id=%s",(reward,ref['id']))
                 conn.commit()
@@ -159,9 +162,15 @@ def get_progress():
     row=c.fetchone(); conn.close()
     if not row: return jsonify({'found':False})
     user=dict(row); user.pop('password',None)
-    for f in ['is_tasks_done','claimed_quests','claimed_promos','upgrades','earned_promocodes']:
-        try: user[f]=json.loads(user.get(f) or '[]')
-        except: user[f]=[] if f!='upgrades' else {}
+    for f in ['is_tasks_done','claimed_quests','claimed_promos','earned_promocodes']:
+        try:
+            v = json.loads(user.get(f) or '[]')
+            user[f] = v if isinstance(v, list) else []
+        except: user[f]=[]
+    try:
+        u = json.loads(user.get('upgrades') or '{}')
+        user['upgrades'] = u if isinstance(u, dict) else {}
+    except: user['upgrades']={}
     return jsonify({'found':True,'user':user})
 
 @app.route('/save-progress', methods=['POST'])
@@ -190,21 +199,34 @@ def save_progress():
 
 @app.route('/claim-quest', methods=['POST'])
 def claim_quest():
-    d=request.get_json() or {}; token=d.get('token'); qid=d.get('quest_id')
-    reward=int(d.get('reward',0))
-    if not token or not qid: return jsonify({'success':False,'error':'bad params'}),400
-    conn=get_db(); c=cur(conn)
-    c.execute("SELECT claimed_quests,score FROM users WHERE token=%s",(token,))
-    row=c.fetchone()
-    if not row: conn.close(); return jsonify({'success':False,'error':'user not found'}),401
-    try: claimed=json.loads(row['claimed_quests'] or '[]')
-    except: claimed=[]
-    if qid in claimed: conn.close(); return jsonify({'success':False,'error':'Уже забрано'}),400
-    claimed.append(qid); new_score=(row['score'] or 0)+reward
-    c.execute("UPDATE users SET claimed_quests=%s,score=%s WHERE token=%s",
-        (json.dumps(claimed),new_score,token))
-    conn.commit(); conn.close()
-    return jsonify({'success':True,'new_score':new_score,'claimed':claimed})
+    try:
+        d=request.get_json() or {}; token=d.get('token'); qid=d.get('quest_id')
+        try:
+            reward=int(d.get('reward',0))
+        except:
+            reward=0
+        if not token or not qid: return jsonify({'success':False,'error':'bad params'}),400
+        conn=get_db(); c=cur(conn)
+        c.execute("SELECT claimed_quests,score FROM users WHERE token=%s",(token,))
+        row=c.fetchone()
+        if not row: conn.close(); return jsonify({'success':False,'error':'user not found'}),401
+        try:
+            claimed=json.loads(row['claimed_quests'] or '[]')
+            if not isinstance(claimed, list): claimed=[]
+        except: claimed=[]
+        claimed=[str(x) for x in claimed]
+        if str(qid) in claimed:
+            conn.close(); return jsonify({'success':False,'error':'Уже забрано'}),400
+        claimed.append(str(qid))
+        new_score=(row['score'] or 0)+reward
+        c.execute("UPDATE users SET claimed_quests=%s,score=%s WHERE token=%s",
+            (json.dumps(claimed),new_score,token))
+        conn.commit(); conn.close()
+        return jsonify({'success':True,'new_score':new_score,'claimed':claimed})
+    except Exception as e:
+        print("[claim-quest ERROR]", e)
+        traceback.print_exc()
+        return jsonify({'success':False,'error':'Ошибка: '+str(e)}),500
 
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -403,6 +425,7 @@ def chat_stats():
     return jsonify({'success':True,'total_players':total,'unique_chatters':chatters,
         'online_now':online,'history':history})
 
+# ==================== ГРУППЫ ====================
 @app.route('/groups/create', methods=['POST'])
 def groups_create():
     d=request.get_json() or {}; token=d.get('token'); name=(d.get('name') or '').strip()
@@ -414,23 +437,50 @@ def groups_create():
     c.execute("""INSERT INTO group_chats (name,owner_id,invite_code,created_at)
         VALUES (%s,%s,%s,%s) RETURNING id""",(name,u['id'],code,now_ms))
     cid=c.fetchone()['id']
-    c.execute("INSERT INTO group_members (chat_id,user_id,joined_at) VALUES (%s,%s,%s)",
-        (cid,u['id'],now_ms))
+    c.execute("""INSERT INTO group_members (chat_id,user_id,joined_at,is_admin)
+        VALUES (%s,%s,%s,1)""",(cid,u['id'],now_ms))
     conn.commit(); conn.close()
     return jsonify({'success':True,'chat_id':cid,'invite_code':code,'name':name})
 
 @app.route('/groups/list', methods=['GET'])
 def groups_list():
+    """Только группы, где пользователь состоит."""
     token=request.args.get('token')
     if not token: return jsonify({'success':False,'chats':[]})
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'chats':[]})
     conn=get_db(); c=cur(conn)
-    c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at
+    c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
+        (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
         FROM group_chats gc JOIN group_members gm ON gm.chat_id=gc.id
         WHERE gm.user_id=%s ORDER BY gc.created_at DESC""",(u['id'],))
     chats=[{'id':r['id'],'name':r['name'],'invite_code':r['invite_code'],
-        'owner_id':r['owner_id'],'is_owner':r['owner_id']==u['id']} for r in c.fetchall()]
+        'owner_id':r['owner_id'],'is_owner':r['owner_id']==u['id'],
+        'member_count':r['member_count'] or 0,'is_member':True} for r in c.fetchall()]
+    conn.close(); return jsonify({'success':True,'chats':chats})
+
+@app.route('/groups/all', methods=['GET'])
+def groups_all():
+    """ВСЕ группы. is_member показывает, состоит ли пользователь."""
+    token=request.args.get('token')
+    if not token: return jsonify({'success':False,'chats':[]})
+    u=_get_user_full_by_token(token)
+    if not u: return jsonify({'success':False,'chats':[]})
+    conn=get_db(); c=cur(conn)
+    c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
+        u.nickname as owner_nickname,
+        (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count,
+        (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id AND user_id=%s) as is_member
+        FROM group_chats gc
+        LEFT JOIN users u ON u.id=gc.owner_id
+        ORDER BY gc.created_at DESC LIMIT 200""",(u['id'],))
+    chats=[{
+        'id':r['id'],'name':r['name'],'invite_code':r['invite_code'],
+        'owner_id':r['owner_id'],'owner_nickname':r['owner_nickname'],
+        'member_count':r['member_count'] or 0,
+        'is_member':(r['is_member'] or 0)>0,
+        'is_owner':r['owner_id']==u['id']
+    } for r in c.fetchall()]
     conn.close(); return jsonify({'success':True,'chats':chats})
 
 @app.route('/groups/join', methods=['POST'])
@@ -676,7 +726,7 @@ GAME_CONFIG = {
 }
 
 MIN_BET = 1000
-MAX_BET = 999999999999999  # без лимита сверху
+MAX_BET = 999999999999999
 
 @app.route('/games/list', methods=['GET'])
 def games_list():
