@@ -60,6 +60,11 @@ def init_db():
         ('can_kick','INTEGER DEFAULT 0'),('can_pin','INTEGER DEFAULT 0'),('can_edit','INTEGER DEFAULT 0')]:
         try: c.execute(f"ALTER TABLE group_members ADD COLUMN {col} {ddl}"); conn.commit()
         except: conn.rollback()
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_group_member ON group_members(chat_id, user_id)")
+        conn.commit()
+    except Exception as e:
+        print("[DB] uniq_group_member:", e); conn.rollback()
     c.execute("""CREATE TABLE IF NOT EXISTS group_messages (
         id SERIAL PRIMARY KEY, chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
         nickname TEXT NOT NULL, text TEXT NOT NULL, created_at BIGINT NOT NULL)""")
@@ -434,22 +439,34 @@ def groups_create():
     if not u: return jsonify({'success':False,'error':'user not found'}),401
     code=secrets.token_urlsafe(8); now_ms=int(time.time()*1000)
     conn=get_db(); c=cur(conn)
+    # 1. Создаём саму группу
     c.execute("""INSERT INTO group_chats (name,owner_id,invite_code,created_at)
         VALUES (%s,%s,%s,%s) RETURNING id""",(name,u['id'],code,now_ms))
     cid=c.fetchone()['id']
+    # 2. Добавляем владельца как участника (безопасно, без ON CONFLICT)
     c.execute("""INSERT INTO group_members (chat_id,user_id,joined_at,is_admin)
-        VALUES (%s,%s,%s,1)""",(cid,u['id'],now_ms))
+        SELECT %s,%s,%s,1
+        WHERE NOT EXISTS (SELECT 1 FROM group_members WHERE chat_id=%s AND user_id=%s)""",
+        (cid,u['id'],now_ms,cid,u['id']))
     conn.commit(); conn.close()
     return jsonify({'success':True,'chat_id':cid,'invite_code':code,'name':name})
-
 @app.route('/groups/list', methods=['GET'])
 def groups_list():
-    """Только группы, где пользователь состоит."""
+    """Только группы, где пользователь состоит или является владельцем."""
     token=request.args.get('token')
     if not token: return jsonify({'success':False,'chats':[]})
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'chats':[]})
     conn=get_db(); c=cur(conn)
+    # Авто-починка: если пользователь владелец, но его нет в group_members — добавляем
+    c.execute("""
+        INSERT INTO group_members (chat_id, user_id, joined_at, is_admin)
+        SELECT gc.id, %s, %s, 1
+        FROM group_chats gc
+        WHERE gc.owner_id = %s
+          AND NOT EXISTS (SELECT 1 FROM group_members gm WHERE gm.chat_id=gc.id AND gm.user_id=%s)
+    """, (u['id'], int(time.time()*1000), u['id'], u['id']))
+    conn.commit()
     c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
         (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
         FROM group_chats gc JOIN group_members gm ON gm.chat_id=gc.id
@@ -827,6 +844,38 @@ def games_top_wins():
     rows = c.fetchall(); conn.close()
     return jsonify({'success': True, 'wins': [dict(r) for r in rows]})
 
+@app.route('/groups/cleanup', methods=['POST'])
+def groups_cleanup():
+    """Удаляет группы текущего пользователя, оставляя только те, что он создал или где он реально участник."""
+    d=request.get_json() or {}; token=d.get('token'); keep_ids=d.get('keep_ids') or []
+    if not token: return jsonify({'success':False,'error':'bad params'}),400
+    u=_get_user_full_by_token(token)
+    if not u: return jsonify({'success':False,'error':'user not found'}),401
+    conn=get_db(); c=cur(conn)
+    # Находим все группы, где пользователь — владелец или участник
+    c.execute("""SELECT gc.id FROM group_chats gc
+        WHERE gc.owner_id=%s
+        OR EXISTS (SELECT 1 FROM group_members gm WHERE gm.chat_id=gc.id AND gm.user_id=%s)""",
+        (u['id'], u['id']))
+    all_ids = [r['id'] for r in c.fetchall()]
+    # Что удаляем: все, что не в keep_ids
+    keep_set = set(int(x) for x in keep_ids)
+    to_delete = [i for i in all_ids if i not in keep_set]
+    for cid in to_delete:
+        # Удаляем только те, где пользователь — владелец (чтобы не удалять чужие)
+        c.execute("SELECT owner_id FROM group_chats WHERE id=%s", (cid,))
+        row=c.fetchone()
+        if row and row['owner_id']==u['id']:
+            c.execute("DELETE FROM group_messages WHERE chat_id=%s", (cid,))
+            c.execute("DELETE FROM group_members WHERE chat_id=%s", (cid,))
+            c.execute("DELETE FROM group_chats WHERE id=%s", (cid,))
+        else:
+            # Просто выходим из группы
+            c.execute("DELETE FROM group_members WHERE chat_id=%s AND user_id=%s", (cid, u['id']))
+    conn.commit(); conn.close()
+    return jsonify({'success':True,'deleted':len(to_delete)})
+
+
 @app.route('/')
 def index(): return jsonify({'status':'ok','message':'IngSoft API v2'})
 
@@ -835,3 +884,4 @@ init_db()
 if __name__ == '__main__':
     port=int(os.getenv('PORT',5000))
     app.run(host='0.0.0.0',port=port)
+    
