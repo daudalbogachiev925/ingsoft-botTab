@@ -43,7 +43,8 @@ def init_db():
         last_seen BIGINT DEFAULT 0, role TEXT DEFAULT 'user', created_at BIGINT)""")
     for col,ddl in [('last_seen','BIGINT DEFAULT 0'),('avatar_data','TEXT'),
         ('referrer_nickname','TEXT'),('referrer_id','INTEGER'),
-        ('role',"TEXT DEFAULT 'user'"),('referral_seen_id','INTEGER DEFAULT 0')]:
+        ('role',"TEXT DEFAULT 'user'"),('referral_seen_id','INTEGER DEFAULT 0'),
+        ('referral_pending','INTEGER DEFAULT 0')]:
         try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}"); conn.commit()
         except: conn.rollback()
     c.execute("""CREATE TABLE IF NOT EXISTS messages (
@@ -133,7 +134,9 @@ def register():
             ref_count=c.fetchone()['cnt'] or 0
             reward=per_referral_reward(ref_count)
             if reward>0:
-                c.execute("UPDATE users SET is_balance=is_balance+%s WHERE id=%s",(reward,ref['id']))
+                # НЕ начисляем сразу, а копим в referral_pending
+                c.execute("UPDATE users SET referral_pending=COALESCE(referral_pending,0)+%s WHERE id=%s",
+                    (reward,ref['id']))
                 conn.commit()
         return jsonify({'ok':True,'referrer':ref['nickname'] if ref else None,
             'referrer_id':ref['id'] if ref else None,'reward':reward})
@@ -320,6 +323,52 @@ def my_referrals():
         ORDER BY id ASC""",(me['id'],me['nickname']))
     refs=[{'nickname':r['nickname']} for r in c.fetchall()]
     conn.close(); return jsonify({'success':True,'referrals':refs,'count':len(refs)})
+
+@app.route('/my-referral-stats', methods=['GET'])
+def my_referral_stats():
+    """Возвращает: сколько приглашено, сколько накоплено, сколько всего заработано."""
+    token=request.args.get('token')
+    if not token: return jsonify({'success':False,'invited':0,'pending':0,'total_earned':0,'claimed':0})
+    conn=get_db(); c=cur(conn)
+    c.execute("SELECT id,nickname,referral_pending,is_balance FROM users WHERE token=%s",(token,))
+    me=c.fetchone()
+    if not me:
+        conn.close(); return jsonify({'success':False,'invited':0,'pending':0,'total_earned':0,'claimed':0})
+    c.execute("SELECT COUNT(*) as cnt FROM users WHERE referrer_id=%s OR referrer_nickname=%s",
+        (me['id'],me['nickname']))
+    invited = c.fetchone()['cnt'] or 0
+    total_earned = compute_referral_reward(invited)
+    pending = me['referral_pending'] or 0
+    claimed = total_earned - pending
+    conn.close()
+    return jsonify({
+        'success':True,
+        'invited': invited,
+        'pending': pending,
+        'total_earned': total_earned,
+        'claimed': claimed
+    })
+
+@app.route('/claim-referral-bonus', methods=['POST'])
+def claim_referral_bonus():
+    """Забирает накопленные IS за рефералов и переводит их в основной баланс."""
+    d=request.get_json() or {}; token=d.get('token')
+    if not token: return jsonify({'success':False,'error':'bad params'}),400
+    conn=get_db(); c=cur(conn)
+    c.execute("SELECT referral_pending, is_balance FROM users WHERE token=%s",(token,))
+    row=c.fetchone()
+    if not row:
+        conn.close(); return jsonify({'success':False,'error':'user not found'}),401
+    pending = row['referral_pending'] or 0
+    if pending <= 0:
+        conn.close(); return jsonify({'success':False,'error':'Нечего забирать','pending':0}),400
+    new_balance = (row['is_balance'] or 0) + pending
+    c.execute("UPDATE users SET is_balance=%s, referral_pending=0 WHERE token=%s",
+        (new_balance, token))
+    conn.commit(); conn.close()
+    return jsonify({'success':True,'claimed':pending,'new_balance':new_balance})
+
+
 
 @app.route('/claim-referral', methods=['POST'])
 def claim_referral():
