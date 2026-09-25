@@ -45,7 +45,9 @@ def init_db():
         ('referrer_nickname','TEXT'),('referrer_id','INTEGER'),
         ('role',"TEXT DEFAULT 'user'"),('referral_seen_id','INTEGER DEFAULT 0'),
         ('referral_pending','INTEGER DEFAULT 0'),
-        ('is_owner','INTEGER DEFAULT 0')]:
+        ('is_owner','INTEGER DEFAULT 0'),
+        ('chat_banned','INTEGER DEFAULT 0'),
+        ('chat_ban_reason','TEXT')]:
         try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}"); conn.commit()
         except: conn.rollback()
     c.execute("""CREATE TABLE IF NOT EXISTS messages (
@@ -76,6 +78,25 @@ def init_db():
         payout BIGINT NOT NULL, multiplier REAL NOT NULL, created_at BIGINT NOT NULL)""")
     try: c.execute("CREATE INDEX IF NOT EXISTS idx_game_bets_created ON game_bets(created_at DESC)")
     except: conn.rollback()
+    
+    # ============ НОВЫЕ ТАБЛИЦЫ ДЛЯ АДМИНА ============
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_promos (
+        id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, coins BIGINT DEFAULT 0,
+        multiplier INTEGER DEFAULT 1, description TEXT, created_at BIGINT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_quests (
+        id SERIAL PRIMARY KEY, quest_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+        description TEXT, reward BIGINT DEFAULT 0, condition_type TEXT, condition_value BIGINT,
+        created_at BIGINT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_boosts (
+        id SERIAL PRIMARY KEY, boost_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+        description TEXT, price BIGINT DEFAULT 0, boost_type TEXT, boost_value BIGINT,
+        created_at BIGINT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_companies (
+        id SERIAL PRIMARY KEY, company_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+        description TEXT, icon TEXT, color TEXT, max_total INTEGER DEFAULT 10,
+        hint TEXT, address TEXT, about TEXT, features TEXT, links TEXT,
+        schedule TEXT, phone TEXT, codes TEXT, created_at BIGINT NOT NULL)""")
+    
     # ============ СОЗДАНИЕ АККАУНТА ВЛАДЕЛЬЦА ============
     try:
         owner_login = 'Daud'
@@ -83,7 +104,6 @@ def init_db():
         c.execute("SELECT id FROM users WHERE login=%s", (owner_login,))
         existing = c.fetchone()
         if existing:
-            # Обновляем пароль и флаги владельца, если аккаунт уже есть
             c.execute("""UPDATE users SET password=%s, nickname=%s, gender=%s,
                 phone=%s, region=%s, full_name=%s, is_owner=1, role='owner'
                 WHERE login=%s""",
@@ -91,7 +111,6 @@ def init_db():
                  '89188128102', 'Ингушетия', 'Daud (Владелец)', owner_login))
             print("[DB] Owner account updated")
         else:
-            # Создаём нового владельца
             now_ms = int(time.time()*1000)
             c.execute("""INSERT INTO users (login, password, nickname, gender,
                 phone, region, full_name, is_owner, role, energy, max_energy,
@@ -112,17 +131,236 @@ def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 def generate_token(): return secrets.token_urlsafe(32)
 
 def compute_referral_reward(n):
-    """Сколько ВСЕГО IS начислено за N друзей."""
     if n <= 0: return 0
     if n <= 100: return n * 100
     return 100 * 100 + (n - 100) * 450
 
 def per_referral_reward(n):
-    """Сколько IS за N-го друга."""
     if n <= 0: return 0
     if n <= 100: return 100
     return 450
 
+def _is_owner(token):
+    if not token: return False
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT is_owner, role FROM users WHERE token=%s", (token,))
+    row = c.fetchone(); conn.close()
+    return row and (row.get('is_owner') == 1 or row.get('role') == 'owner')
+
+# ==================== АДМИН-ЭНДПОИНТЫ ====================
+@app.route('/admin/add-score', methods=['POST'])
+def admin_add_score():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    target_nick = d.get('nickname')
+    amount = int(d.get('amount', 0))
+    if not target_nick or amount == 0: return jsonify({'success': False, 'error': 'Укажите ник и сумму'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("UPDATE users SET score = score + %s WHERE nickname=%s", (amount, target_nick))
+    conn.commit()
+    ch = c.rowcount
+    conn.close()
+    if ch == 0: return jsonify({'success': False, 'error': 'Игрок не найден'}), 404
+    return jsonify({'success': True, 'message': f'Начислено {amount} очков игроку {target_nick}'})
+
+@app.route('/admin/add-promo', methods=['POST'])
+def admin_add_promo():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    target_nick = d.get('nickname')
+    code = (d.get('code') or '').strip().upper()
+    if not target_nick or not code: return jsonify({'success': False, 'error': 'Укажите ник и код'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT earned_promocodes FROM users WHERE nickname=%s", (target_nick,))
+    row = c.fetchone()
+    if not row: conn.close(); return jsonify({'success': False, 'error': 'Игрок не найден'}), 404
+    try:
+        earned = json.loads(row['earned_promocodes'] or '[]')
+        if not isinstance(earned, list): earned = []
+    except: earned = []
+    if code not in earned:
+        earned.append(code)
+        c.execute("UPDATE users SET earned_promocodes=%s WHERE nickname=%s", (json.dumps(earned), target_nick))
+        conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': f'Промокод {code} выдан игроку {target_nick}'})
+
+@app.route('/admin/add-shop-promo', methods=['POST'])
+def admin_add_shop_promo():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    code = (d.get('code') or '').strip().upper()
+    coins = int(d.get('coins', 0))
+    mult = int(d.get('multiplier', 1))
+    desc = d.get('description', '')
+    if not code: return jsonify({'success': False, 'error': 'Укажите код'}), 400
+    conn = get_db(); c = cur(conn)
+    try:
+        c.execute("INSERT INTO admin_promos (code, coins, multiplier, description, created_at) VALUES (%s,%s,%s,%s,%s)",
+                  (code, coins, mult, desc, int(time.time()*1000)))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback(); conn.close()
+        return jsonify({'success': False, 'error': 'Такой код уже существует'}), 400
+    conn.close()
+    return jsonify({'success': True, 'message': f'Промокод {code} добавлен в магазин'})
+
+@app.route('/admin/add-quest', methods=['POST'])
+def admin_add_quest():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    qid = (d.get('quest_id') or '').strip()
+    name = d.get('name', '')
+    desc = d.get('description', '')
+    reward = int(d.get('reward', 0))
+    ctype = d.get('condition_type', 'total_taps')
+    cval = int(d.get('condition_value', 0))
+    if not qid or not name: return jsonify({'success': False, 'error': 'Укажите ID и название'}), 400
+    conn = get_db(); c = cur(conn)
+    try:
+        c.execute("INSERT INTO admin_quests (quest_id, name, description, reward, condition_type, condition_value, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                  (qid, name, desc, reward, ctype, cval, int(time.time()*1000)))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback(); conn.close()
+        return jsonify({'success': False, 'error': 'Такой квест уже есть'}), 400
+    conn.close()
+    return jsonify({'success': True, 'message': f'Квест {name} добавлен'})
+
+@app.route('/admin/add-boost', methods=['POST'])
+def admin_add_boost():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    bid = (d.get('boost_id') or '').strip()
+    name = d.get('name', '')
+    desc = d.get('description', '')
+    price = int(d.get('price', 0))
+    btype = d.get('boost_type', 'multiplier')
+    bval = int(d.get('boost_value', 1))
+    if not bid or not name: return jsonify({'success': False, 'error': 'Укажите ID и название'}), 400
+    conn = get_db(); c = cur(conn)
+    try:
+        c.execute("INSERT INTO admin_boosts (boost_id, name, description, price, boost_type, boost_value, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                  (bid, name, desc, price, btype, bval, int(time.time()*1000)))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback(); conn.close()
+        return jsonify({'success': False, 'error': 'Такой буст уже есть'}), 400
+    conn.close()
+    return jsonify({'success': True, 'message': f'Буст {name} добавлен'})
+
+@app.route('/admin/add-company', methods=['POST'])
+def admin_add_company():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    cid = (d.get('company_id') or '').strip()
+    name = d.get('name', '')
+    desc = d.get('description', '')
+    icon = d.get('icon', '🏢')
+    color = d.get('color', '#8b5cf6')
+    max_total = int(d.get('max_total', 10))
+    hint = d.get('hint', '')
+    address = d.get('address', '')
+    about = d.get('about', '')
+    features = d.get('features', [])
+    links = d.get('links', [])
+    schedule = d.get('schedule', '')
+    phone = d.get('phone', '')
+    codes = d.get('codes', [])
+    if not cid or not name: return jsonify({'success': False, 'error': 'Укажите ID и название'}), 400
+    conn = get_db(); c = cur(conn)
+    try:
+        c.execute("""INSERT INTO admin_companies (company_id, name, description, icon, color, max_total, hint, address, about, features, links, schedule, phone, codes, created_at)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  (cid, name, desc, icon, color, max_total, hint, address, about,
+                   json.dumps(features), json.dumps(links), schedule, phone, json.dumps(codes),
+                   int(time.time()*1000)))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback(); conn.close()
+        return jsonify({'success': False, 'error': 'Такая компания уже есть'}), 400
+    conn.close()
+    return jsonify({'success': True, 'message': f'Компания {name} добавлена'})
+
+@app.route('/admin/ban-chat', methods=['POST'])
+def admin_ban_chat():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    target_nick = d.get('nickname')
+    reason = d.get('reason', 'Нарушение правил')
+    if not target_nick: return jsonify({'success': False, 'error': 'Укажите ник'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("UPDATE users SET chat_banned=1, chat_ban_reason=%s WHERE nickname=%s", (reason, target_nick))
+    conn.commit()
+    ch = c.rowcount
+    conn.close()
+    if ch == 0: return jsonify({'success': False, 'error': 'Игрок не найден'}), 404
+    return jsonify({'success': True, 'message': f'Игрок {target_nick} заблокирован в чате. Причина: {reason}'})
+
+@app.route('/admin/unban-chat', methods=['POST'])
+def admin_unban_chat():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    target_nick = d.get('nickname')
+    if not target_nick: return jsonify({'success': False, 'error': 'Укажите ник'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("UPDATE users SET chat_banned=0, chat_ban_reason=NULL WHERE nickname=%s", (target_nick,))
+    conn.commit()
+    ch = c.rowcount
+    conn.close()
+    if ch == 0: return jsonify({'success': False, 'error': 'Игрок не найден'}), 404
+    return jsonify({'success': True, 'message': f'Игрок {target_nick} разблокирован в чате'})
+
+@app.route('/admin/delete-group', methods=['POST'])
+def admin_delete_group():
+    d = request.get_json() or {}
+    token = d.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    group_name = d.get('name', '').strip()
+    reason = d.get('reason', 'Удалено владельцем')
+    if not group_name: return jsonify({'success': False, 'error': 'Укажите название группы'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT id FROM group_chats WHERE name=%s", (group_name,))
+    row = c.fetchone()
+    if not row: conn.close(); return jsonify({'success': False, 'error': 'Группа не найдена'}), 404
+    cid = row['id']
+    c.execute("DELETE FROM group_messages WHERE chat_id=%s", (cid,))
+    c.execute("DELETE FROM group_members WHERE chat_id=%s", (cid,))
+    c.execute("DELETE FROM group_chats WHERE id=%s", (cid,))
+    conn.commit(); conn.close()
+    return jsonify({'success': True, 'message': f'Группа "{group_name}" удалена. Причина: {reason}'})
+
+@app.route('/admin/list-data', methods=['GET'])
+def admin_list_data():
+    token = request.args.get('token')
+    if not _is_owner(token): return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT * FROM admin_promos ORDER BY id DESC")
+    promos = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT * FROM admin_quests ORDER BY id DESC")
+    quests = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT * FROM admin_boosts ORDER BY id DESC")
+    boosts = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT * FROM admin_companies ORDER BY id DESC")
+    companies = []
+    for r in c.fetchall():
+        d = dict(r)
+        for f in ['features','links','codes']:
+            try: d[f] = json.loads(d[f] or '[]')
+            except: d[f] = []
+        companies.append(d)
+    conn.close()
+    return jsonify({'success': True, 'promos': promos, 'quests': quests, 'boosts': boosts, 'companies': companies})
+
+# ==================== ОБЫЧНЫЕ ЭНДПОИНТЫ ====================
 @app.route('/register', methods=['POST'])
 def register():
     d = request.get_json() or {}
@@ -165,7 +403,6 @@ def register():
             ref_count=c.fetchone()['cnt'] or 0
             reward=per_referral_reward(ref_count)
             if reward>0:
-                # НЕ начисляем сразу, а копим в referral_pending
                 c.execute("UPDATE users SET referral_pending=COALESCE(referral_pending,0)+%s WHERE id=%s",
                     (reward,ref['id']))
                 conn.commit()
@@ -357,7 +594,6 @@ def my_referrals():
 
 @app.route('/my-referral-stats', methods=['GET'])
 def my_referral_stats():
-    """Возвращает: сколько приглашено, сколько накоплено, сколько всего заработано."""
     token=request.args.get('token')
     if not token: return jsonify({'success':False,'invited':0,'pending':0,'total_earned':0,'claimed':0})
     conn=get_db(); c=cur(conn)
@@ -382,7 +618,6 @@ def my_referral_stats():
 
 @app.route('/claim-referral-bonus', methods=['POST'])
 def claim_referral_bonus():
-    """Забирает накопленные IS за рефералов и переводит их в основной баланс."""
     d=request.get_json() or {}; token=d.get('token')
     if not token: return jsonify({'success':False,'error':'bad params'}),400
     conn=get_db(); c=cur(conn)
@@ -399,8 +634,6 @@ def claim_referral_bonus():
     conn.commit(); conn.close()
     return jsonify({'success':True,'claimed':pending,'new_balance':new_balance})
 
-
-
 @app.route('/claim-referral', methods=['POST'])
 def claim_referral():
     d=request.get_json() or {}; token=d.get('token'); amount=int(d.get('amount',0))
@@ -414,12 +647,12 @@ def check_sub(): return jsonify({'subscribed':True})
 
 def _get_user_by_token(token):
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id,nickname,gender,region,role,is_owner FROM users WHERE token=%s",(token,))
+    c.execute("SELECT id,nickname,gender,region,role,is_owner,chat_banned FROM users WHERE token=%s",(token,))
     u=c.fetchone(); conn.close(); return u
 
 def _get_user_full_by_token(token):
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id,nickname,gender,is_owner FROM users WHERE token=%s",(token,))
+    c.execute("SELECT id,nickname,gender,is_owner,role FROM users WHERE token=%s",(token,))
     u=c.fetchone(); conn.close(); return u
 
 def _is_admin(token):
@@ -433,7 +666,8 @@ def send_message():
         if len(text)>500: return jsonify({'success':False,'error':'Слишком длинное'}),400
         u=_get_user_by_token(token)
         if not u: return jsonify({'success':False,'error':'Пользователь не найден'}),401
-        # Владелец может писать в любой чат
+        if u.get('chat_banned'):
+            return jsonify({'success':False,'error':'Вы заблокированы в чате. Причина: ' + (u.get('chat_ban_reason') or 'не указана')}),403
         is_owner = u.get('is_owner') == 1 or u.get('role') == 'owner'
         if not is_owner:
             region=(u['region'] or '').strip().lower()
@@ -459,7 +693,6 @@ def get_messages():
         is_owner = u.get('is_owner') == 1 or u.get('role') == 'owner'
         conn=get_db(); c=cur(conn)
         if is_owner:
-            # Владелец видит ВСЕ сообщения из всех чатов
             c.execute("""SELECT id,nickname,gender,text,created_at FROM messages
                 ORDER BY id DESC LIMIT 200""")
         else:
@@ -478,7 +711,7 @@ def get_messages():
 def delete_message():
     d=request.get_json() or {}; token=d.get('token'); mid=d.get('message_id')
     if not token or not mid: return jsonify({'success':False,'error':'bad params'}),400
-    if not _is_admin(token): return jsonify({'success':False,'error':'Только для админов'}),403
+    if not _is_admin(token) and not _is_owner(token): return jsonify({'success':False,'error':'Только для админов'}),403
     conn=get_db(); c=cur(conn)
     c.execute("DELETE FROM messages WHERE id=%s",(mid,))
     conn.commit(); conn.close(); return jsonify({'success':True})
@@ -488,7 +721,7 @@ def edit_message():
     d=request.get_json() or {}; token=d.get('token'); mid=d.get('message_id')
     nt=(d.get('text') or '').strip()
     if not token or not mid or not nt: return jsonify({'success':False,'error':'bad params'}),400
-    if not _is_admin(token): return jsonify({'success':False,'error':'Только для админов'}),403
+    if not _is_admin(token) and not _is_owner(token): return jsonify({'success':False,'error':'Только для админов'}),403
     conn=get_db(); c=cur(conn)
     c.execute("UPDATE messages SET text=%s WHERE id=%s",(nt,mid))
     conn.commit(); conn.close(); return jsonify({'success':True})
@@ -497,7 +730,7 @@ def edit_message():
 def pin_message():
     d=request.get_json() or {}; token=d.get('token'); mid=d.get('message_id')
     if not token or not mid: return jsonify({'success':False,'error':'bad params'}),400
-    if not _is_admin(token): return jsonify({'success':False,'error':'Только для админов'}),403
+    if not _is_admin(token) and not _is_owner(token): return jsonify({'success':False,'error':'Только для админов'}),403
     return jsonify({'success':True})
 
 @app.route('/chat-stats', methods=['GET'])
@@ -528,26 +761,32 @@ def groups_create():
     if not u: return jsonify({'success':False,'error':'user not found'}),401
     code=secrets.token_urlsafe(8); now_ms=int(time.time()*1000)
     conn=get_db(); c=cur(conn)
-    # 1. Создаём саму группу
     c.execute("""INSERT INTO group_chats (name,owner_id,invite_code,created_at)
         VALUES (%s,%s,%s,%s) RETURNING id""",(name,u['id'],code,now_ms))
     cid=c.fetchone()['id']
-    # 2. Добавляем владельца как участника (безопасно, без ON CONFLICT)
+    # Владелец группы
     c.execute("""INSERT INTO group_members (chat_id,user_id,joined_at,is_admin)
         SELECT %s,%s,%s,1
         WHERE NOT EXISTS (SELECT 1 FROM group_members WHERE chat_id=%s AND user_id=%s)""",
         (cid,u['id'],now_ms,cid,u['id']))
+    # Автодобавление ВЛАДЕЛЬЦА ИГРЫ (Daud) во все группы
+    c.execute("SELECT id FROM users WHERE is_owner=1 OR role='owner'")
+    owner_row = c.fetchone()
+    if owner_row and owner_row['id'] != u['id']:
+        c.execute("""INSERT INTO group_members (chat_id,user_id,joined_at,is_admin)
+            SELECT %s,%s,%s,1
+            WHERE NOT EXISTS (SELECT 1 FROM group_members WHERE chat_id=%s AND user_id=%s)""",
+            (cid, owner_row['id'], now_ms, cid, owner_row['id']))
     conn.commit(); conn.close()
     return jsonify({'success':True,'chat_id':cid,'invite_code':code,'name':name})
+
 @app.route('/groups/list', methods=['GET'])
 def groups_list():
-    """Только группы, где пользователь состоит или является владельцем."""
     token=request.args.get('token')
     if not token: return jsonify({'success':False,'chats':[]})
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'chats':[]})
     conn=get_db(); c=cur(conn)
-    # Авто-починка: если пользователь владелец, но его нет в group_members — добавляем
     c.execute("""
         INSERT INTO group_members (chat_id, user_id, joined_at, is_admin)
         SELECT gc.id, %s, %s, 1
@@ -558,7 +797,6 @@ def groups_list():
     conn.commit()
     is_owner = u.get('is_owner') == 1
     if is_owner:
-        # Владелец видит ВСЕ группы
         c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
             (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
             FROM group_chats gc ORDER BY gc.created_at DESC""")
@@ -574,7 +812,6 @@ def groups_list():
 
 @app.route('/groups/all', methods=['GET'])
 def groups_all():
-    """ВСЕ группы. is_member показывает, состоит ли пользователь."""
     token=request.args.get('token')
     if not token: return jsonify({'success':False,'chats':[]})
     u=_get_user_full_by_token(token)
@@ -635,7 +872,7 @@ def groups_add_member():
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     chat=c.fetchone()
     if not chat: conn.close(); return jsonify({'success':False,'error':'Чат не найден'}),404
-    if chat['owner_id']!=u['id']:
+    if chat['owner_id']!=u['id'] and not _is_owner(token):
         conn.close(); return jsonify({'success':False,'error':'Только владелец может добавлять'}),403
     c.execute("SELECT id,nickname FROM users WHERE nickname=%s",(nick,))
     t=c.fetchone()
@@ -725,7 +962,7 @@ def _check_group_perm(token,cid,perm_name):
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     ch=c.fetchone()
     if not ch: conn.close(); return u,False,False
-    if ch['owner_id']==u['id']: conn.close(); return u,True,True
+    if ch['owner_id']==u['id'] or _is_owner(token): conn.close(); return u,True,True
     c.execute(f"SELECT {perm_name} FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
     row=c.fetchone(); conn.close()
     return u,False,bool(row and row[perm_name])
@@ -740,7 +977,7 @@ def groups_delete():
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     ch=c.fetchone()
     if not ch: conn.close(); return jsonify({'success':False,'error':'Чат не найден'}),404
-    if ch['owner_id']!=u['id']:
+    if ch['owner_id']!=u['id'] and not _is_owner(token):
         conn.close(); return jsonify({'success':False,'error':'Только владелец'}),403
     c.execute("DELETE FROM group_messages WHERE chat_id=%s",(cid,))
     c.execute("DELETE FROM group_members WHERE chat_id=%s",(cid,))
@@ -805,7 +1042,7 @@ def groups_set_admin():
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     ch=c.fetchone()
     if not ch: conn.close(); return jsonify({'success':False,'error':'Чат не найден'}),404
-    if ch['owner_id']!=u['id']:
+    if ch['owner_id']!=u['id'] and not _is_owner(token):
         conn.close(); return jsonify({'success':False,'error':'Только владелец назначает'}),403
     c.execute("""UPDATE group_members SET is_admin=%s,can_delete_messages=%s,
         can_kick=%s,can_pin=%s,can_edit=%s WHERE chat_id=%s AND user_id=%s""",
@@ -825,7 +1062,7 @@ def groups_rename():
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     ch=c.fetchone()
     if not ch: conn.close(); return jsonify({'success':False,'error':'Чат не найден'}),404
-    if ch['owner_id']!=u['id']: conn.close(); return jsonify({'success':False,'error':'Только владелец'}),403
+    if ch['owner_id']!=u['id'] and not _is_owner(token): conn.close(); return jsonify({'success':False,'error':'Только владелец'}),403
     c.execute("UPDATE group_chats SET name=%s WHERE id=%s",(nn,cid))
     conn.commit(); conn.close(); return jsonify({'success':True,'name':nn})
 
@@ -949,23 +1186,19 @@ def games_top_wins():
 
 @app.route('/groups/cleanup', methods=['POST'])
 def groups_cleanup():
-    """Удаляет группы текущего пользователя, оставляя только те, что он создал или где он реально участник."""
     d=request.get_json() or {}; token=d.get('token'); keep_ids=d.get('keep_ids') or []
     if not token: return jsonify({'success':False,'error':'bad params'}),400
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'error':'user not found'}),401
     conn=get_db(); c=cur(conn)
-    # Находим все группы, где пользователь — владелец или участник
     c.execute("""SELECT gc.id FROM group_chats gc
         WHERE gc.owner_id=%s
         OR EXISTS (SELECT 1 FROM group_members gm WHERE gm.chat_id=gc.id AND gm.user_id=%s)""",
         (u['id'], u['id']))
     all_ids = [r['id'] for r in c.fetchall()]
-    # Что удаляем: все, что не в keep_ids
     keep_set = set(int(x) for x in keep_ids)
     to_delete = [i for i in all_ids if i not in keep_set]
     for cid in to_delete:
-        # Удаляем только те, где пользователь — владелец (чтобы не удалять чужие)
         c.execute("SELECT owner_id FROM group_chats WHERE id=%s", (cid,))
         row=c.fetchone()
         if row and row['owner_id']==u['id']:
@@ -973,11 +1206,9 @@ def groups_cleanup():
             c.execute("DELETE FROM group_members WHERE chat_id=%s", (cid,))
             c.execute("DELETE FROM group_chats WHERE id=%s", (cid,))
         else:
-            # Просто выходим из группы
             c.execute("DELETE FROM group_members WHERE chat_id=%s AND user_id=%s", (cid, u['id']))
     conn.commit(); conn.close()
     return jsonify({'success':True,'deleted':len(to_delete)})
-
 
 @app.route('/')
 def index(): return jsonify({'status':'ok','message':'IngSoft API v2'})
