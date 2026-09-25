@@ -44,7 +44,8 @@ def init_db():
     for col,ddl in [('last_seen','BIGINT DEFAULT 0'),('avatar_data','TEXT'),
         ('referrer_nickname','TEXT'),('referrer_id','INTEGER'),
         ('role',"TEXT DEFAULT 'user'"),('referral_seen_id','INTEGER DEFAULT 0'),
-        ('referral_pending','INTEGER DEFAULT 0')]:
+        ('referral_pending','INTEGER DEFAULT 0'),
+        ('is_owner','INTEGER DEFAULT 0')]:
         try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}"); conn.commit()
         except: conn.rollback()
     c.execute("""CREATE TABLE IF NOT EXISTS messages (
@@ -75,6 +76,36 @@ def init_db():
         payout BIGINT NOT NULL, multiplier REAL NOT NULL, created_at BIGINT NOT NULL)""")
     try: c.execute("CREATE INDEX IF NOT EXISTS idx_game_bets_created ON game_bets(created_at DESC)")
     except: conn.rollback()
+    # ============ СОЗДАНИЕ АККАУНТА ВЛАДЕЛЬЦА ============
+    try:
+        owner_login = 'Daud'
+        owner_pass = 'Daud30051982'
+        c.execute("SELECT id FROM users WHERE login=%s", (owner_login,))
+        existing = c.fetchone()
+        if existing:
+            # Обновляем пароль и флаги владельца, если аккаунт уже есть
+            c.execute("""UPDATE users SET password=%s, nickname=%s, gender=%s,
+                phone=%s, region=%s, full_name=%s, is_owner=1, role='owner'
+                WHERE login=%s""",
+                (hash_password(owner_pass), 'Daud(владелец)', 'male',
+                 '89188128102', 'Ингушетия', 'Daud (Владелец)', owner_login))
+            print("[DB] Owner account updated")
+        else:
+            # Создаём нового владельца
+            now_ms = int(time.time()*1000)
+            c.execute("""INSERT INTO users (login, password, nickname, gender,
+                phone, region, full_name, is_owner, role, energy, max_energy,
+                created_at, last_seen)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,1,'owner',500,500,%s,%s) RETURNING id""",
+                (owner_login, hash_password(owner_pass), 'Daud(владелец)',
+                 'male', '89188128102', 'Ингушетия', 'Daud (Владелец)',
+                 now_ms, now_ms))
+            print("[DB] Owner account created")
+        conn.commit()
+    except Exception as e:
+        print("[DB] Owner creation error:", e)
+        conn.rollback()
+
     conn.commit(); conn.close(); print("[DB] init done")
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
@@ -383,12 +414,12 @@ def check_sub(): return jsonify({'subscribed':True})
 
 def _get_user_by_token(token):
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id,nickname,gender,region,role FROM users WHERE token=%s",(token,))
+    c.execute("SELECT id,nickname,gender,region,role,is_owner FROM users WHERE token=%s",(token,))
     u=c.fetchone(); conn.close(); return u
 
 def _get_user_full_by_token(token):
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id,nickname,gender FROM users WHERE token=%s",(token,))
+    c.execute("SELECT id,nickname,gender,is_owner FROM users WHERE token=%s",(token,))
     u=c.fetchone(); conn.close(); return u
 
 def _is_admin(token):
@@ -402,14 +433,17 @@ def send_message():
         if len(text)>500: return jsonify({'success':False,'error':'Слишком длинное'}),400
         u=_get_user_by_token(token)
         if not u: return jsonify({'success':False,'error':'Пользователь не найден'}),401
-        region=(u['region'] or '').strip().lower()
-        if region!='ингушетия': return jsonify({'success':False,'error':'Чат только для Ингушетии'}),403
+        # Владелец может писать в любой чат
+        is_owner = u.get('is_owner') == 1 or u.get('role') == 'owner'
+        if not is_owner:
+            region=(u['region'] or '').strip().lower()
+            if region!='ингушетия': return jsonify({'success':False,'error':'Чат только для Ингушетии'}),403
         gender=(u['gender'] or 'male').strip().lower()
         if gender not in ('male','female'): gender='male'
         conn=get_db(); c=cur(conn)
         c.execute("""INSERT INTO messages (user_id,nickname,gender,region,text,created_at)
             VALUES (%s,%s,%s,%s,%s,%s)""",
-            (u['id'],u['nickname'],gender,u['region'],text,int(time.time()*1000)))
+            (u['id'],u['nickname'],gender,u['region'] or 'Ингушетия',text,int(time.time()*1000)))
         conn.commit(); conn.close(); return jsonify({'success':True})
     except Exception as e:
         print("[send-message]",e); traceback.print_exc()
@@ -422,14 +456,20 @@ def get_messages():
         if not token: return jsonify({'success':False,'error':'Не авторизован','messages':[]})
         u=_get_user_by_token(token)
         if not u: return jsonify({'success':False,'error':'Не авторизован','messages':[]})
-        my_gender=(u['gender'] or 'male').strip().lower()
-        if my_gender not in ('male','female'): my_gender='male'
+        is_owner = u.get('is_owner') == 1 or u.get('role') == 'owner'
         conn=get_db(); c=cur(conn)
-        c.execute("""SELECT id,nickname,gender,text,created_at FROM messages
-            WHERE gender=%s ORDER BY id DESC LIMIT 100""",(my_gender,))
+        if is_owner:
+            # Владелец видит ВСЕ сообщения из всех чатов
+            c.execute("""SELECT id,nickname,gender,text,created_at FROM messages
+                ORDER BY id DESC LIMIT 200""")
+        else:
+            my_gender=(u['gender'] or 'male').strip().lower()
+            if my_gender not in ('male','female'): my_gender='male'
+            c.execute("""SELECT id,nickname,gender,text,created_at FROM messages
+                WHERE gender=%s ORDER BY id DESC LIMIT 100""",(my_gender,))
         rows=c.fetchall(); conn.close()
         msgs=[dict(r) for r in rows]; msgs.reverse()
-        return jsonify({'success':True,'messages':msgs,'chat':my_gender})
+        return jsonify({'success':True,'messages':msgs,'chat':'all' if is_owner else my_gender})
     except Exception as e:
         print("[get-messages]",e); traceback.print_exc()
         return jsonify({'success':False,'error':'Ошибка сервера','messages':[]}),500
@@ -516,10 +556,17 @@ def groups_list():
           AND NOT EXISTS (SELECT 1 FROM group_members gm WHERE gm.chat_id=gc.id AND gm.user_id=%s)
     """, (u['id'], int(time.time()*1000), u['id'], u['id']))
     conn.commit()
-    c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
-        (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
-        FROM group_chats gc JOIN group_members gm ON gm.chat_id=gc.id
-        WHERE gm.user_id=%s ORDER BY gc.created_at DESC""",(u['id'],))
+    is_owner = u.get('is_owner') == 1
+    if is_owner:
+        # Владелец видит ВСЕ группы
+        c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
+            (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
+            FROM group_chats gc ORDER BY gc.created_at DESC""")
+    else:
+        c.execute("""SELECT gc.id,gc.name,gc.invite_code,gc.owner_id,gc.created_at,
+            (SELECT COUNT(*) FROM group_members WHERE chat_id=gc.id) as member_count
+            FROM group_chats gc JOIN group_members gm ON gm.chat_id=gc.id
+            WHERE gm.user_id=%s ORDER BY gc.created_at DESC""",(u['id'],))
     chats=[{'id':r['id'],'name':r['name'],'invite_code':r['invite_code'],
         'owner_id':r['owner_id'],'is_owner':r['owner_id']==u['id'],
         'member_count':r['member_count'] or 0,'is_member':True} for r in c.fetchall()]
@@ -607,8 +654,10 @@ def groups_members():
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'members':[]})
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
-    if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа'}),403
+    is_owner = u.get('is_owner') == 1
+    if not is_owner:
+        c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
+        if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа'}),403
     c.execute("SELECT owner_id FROM group_chats WHERE id=%s",(cid,))
     ch=c.fetchone(); owner_id=ch['owner_id'] if ch else None
     c.execute("""SELECT u.id,u.nickname,u.gender,gm.joined_at,gm.is_admin,
@@ -632,8 +681,10 @@ def groups_send():
     u=_get_user_full_by_token(token)
     if not u: return jsonify({'success':False,'error':'user not found'}),401
     conn=get_db(); c=cur(conn)
-    c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
-    if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа'}),403
+    is_owner = u.get('is_owner') == 1
+    if not is_owner:
+        c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
+        if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа'}),403
     c.execute("""INSERT INTO group_messages (chat_id,user_id,nickname,text,created_at)
         VALUES (%s,%s,%s,%s,%s)""",(cid,u['id'],u['nickname'],text,int(time.time()*1000)))
     conn.commit(); conn.close(); return jsonify({'success':True})
@@ -646,7 +697,10 @@ def groups_messages():
     if not u: return jsonify({'success':False,'messages':[]})
     conn=get_db(); c=cur(conn)
     c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
-    if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа','messages':[]}),403
+    is_owner = u.get('is_owner') == 1
+    if not is_owner:
+        c.execute("SELECT id FROM group_members WHERE chat_id=%s AND user_id=%s",(cid,u['id']))
+        if not c.fetchone(): conn.close(); return jsonify({'success':False,'error':'Нет доступа','messages':[]}),403
     c.execute("""SELECT id,user_id,nickname,text,created_at FROM group_messages
         WHERE chat_id=%s ORDER BY id DESC LIMIT 100""",(cid,))
     rows=c.fetchall()
