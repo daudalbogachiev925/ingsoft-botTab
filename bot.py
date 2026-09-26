@@ -78,7 +78,7 @@ def init_db():
         payout BIGINT NOT NULL, multiplier REAL NOT NULL, created_at BIGINT NOT NULL)""")
     try: c.execute("CREATE INDEX IF NOT EXISTS idx_game_bets_created ON game_bets(created_at DESC)")
     except: conn.rollback()
-    
+
     # ============ НОВЫЕ ТАБЛИЦЫ ДЛЯ АДМИНА ============
     c.execute("""CREATE TABLE IF NOT EXISTS admin_promos (
         id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, coins BIGINT DEFAULT 0,
@@ -96,7 +96,7 @@ def init_db():
         description TEXT, icon TEXT, color TEXT, max_total INTEGER DEFAULT 10,
         hint TEXT, address TEXT, about TEXT, features TEXT, links TEXT,
         schedule TEXT, phone TEXT, codes TEXT, created_at BIGINT NOT NULL)""")
-    
+
     # ============ СОЗДАНИЕ АККАУНТА ВЛАДЕЛЬЦА ============
     try:
         owner_login = 'Daud'
@@ -377,6 +377,15 @@ def register():
     if len(login)<3: return jsonify({'error':'Логин минимум 3 символа'}),400
     if len(password)<6: return jsonify({'error':'Пароль минимум 6 символов'}),400
     if len(nickname)<2: return jsonify({'error':'Ник минимум 2 символа'}),400
+    # ============ ЗАЩИТА ВЛАДЕЛЬЦА ============
+    nickname_lower = nickname.lower()
+    login_lower = login.lower()
+    if 'владелец' in nickname_lower or 'owner' in nickname_lower or 'admin' in nickname_lower or 'админ' in nickname_lower:
+        return jsonify({'error':'Этот никнейм запрещён'}),400
+    if nickname_lower == 'daud' or login_lower == 'daud':
+        return jsonify({'error':'Этот никнейм занят'}),400
+    if '(владелец)' in nickname_lower or '(owner)' in nickname_lower:
+        return jsonify({'error':'Этот никнейм запрещён'}),400
     conn=get_db(); c=cur(conn)
     try:
         now_ms=int(time.time()*1000)
@@ -764,12 +773,10 @@ def groups_create():
     c.execute("""INSERT INTO group_chats (name,owner_id,invite_code,created_at)
         VALUES (%s,%s,%s,%s) RETURNING id""",(name,u['id'],code,now_ms))
     cid=c.fetchone()['id']
-    # Владелец группы
     c.execute("""INSERT INTO group_members (chat_id,user_id,joined_at,is_admin)
         SELECT %s,%s,%s,1
         WHERE NOT EXISTS (SELECT 1 FROM group_members WHERE chat_id=%s AND user_id=%s)""",
         (cid,u['id'],now_ms,cid,u['id']))
-    # Автодобавление ВЛАДЕЛЬЦА ИГРЫ (Daud) во все группы
     c.execute("SELECT id FROM users WHERE is_owner=1 OR role='owner'")
     owner_row = c.fetchone()
     if owner_row and owner_row['id'] != u['id']:
