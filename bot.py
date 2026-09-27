@@ -124,6 +124,15 @@ def init_db():
     except Exception as e:
         print("[DB] Owner creation error:", e)
         conn.rollback()
+    c.execute("""CREATE TABLE IF NOT EXISTS player_reports (
+        id SERIAL PRIMARY KEY,
+        reporter_id INTEGER NOT NULL,
+        reporter_nickname TEXT,
+        target_id INTEGER NOT NULL,
+        target_nickname TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        seen INTEGER DEFAULT 0,
+        created_at BIGINT NOT NULL)""")
 
     conn.commit(); conn.close(); print("[DB] init done")
 
@@ -360,6 +369,78 @@ def admin_list_data():
     conn.close()
     return jsonify({'success': True, 'promos': promos, 'quests': quests, 'boosts': boosts, 'companies': companies})
 
+# ==================== ЖАЛОБЫ ====================
+@app.route('/report-player', methods=['POST'])
+def report_player():
+    d = request.get_json() or {}
+    token = d.get('token')
+    target_nickname = (d.get('target_nickname') or '').strip()
+    reason = (d.get('reason') or '').strip()
+    if not token or not target_nickname or not reason:
+        return jsonify({'success': False, 'error': 'Заполните все поля'}), 400
+    if len(reason) < 5:
+        return jsonify({'success': False, 'error': 'Слишком короткая причина'}), 400
+    if len(reason) > 500:
+        return jsonify({'success': False, 'error': 'Слишком длинная причина'}), 400
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT id, nickname FROM users WHERE token=%s", (token,))
+    reporter = c.fetchone()
+    if not reporter:
+        conn.close(); return jsonify({'success': False, 'error': 'Не авторизован'}), 401
+    c.execute("SELECT id FROM users WHERE nickname=%s", (target_nickname,))
+    target = c.fetchone()
+    if not target:
+        conn.close(); return jsonify({'success': False, 'error': 'Игрок с таким ником не найден'}), 404
+    if target['id'] == reporter['id']:
+        conn.close(); return jsonify({'success': False, 'error': 'Нельзя жаловаться на себя'}), 400
+    c.execute("""INSERT INTO player_reports (reporter_id, reporter_nickname, target_id, target_nickname, reason, seen, created_at)
+                 VALUES (%s,%s,%s,%s,%s,0,%s)""",
+              (reporter['id'], reporter['nickname'], target['id'], target_nickname, reason, int(time.time()*1000)))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
+@app.route('/admin/reports', methods=['GET'])
+def admin_reports():
+    token = request.args.get('token')
+    if not _is_owner(token):
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    conn = get_db(); c = cur(conn)
+    c.execute("SELECT * FROM player_reports ORDER BY id DESC LIMIT 200")
+    rows = c.fetchall(); conn.close()
+    return jsonify({'success': True, 'reports': [dict(r) for r in rows]})
+
+@app.route('/admin/report-seen', methods=['POST'])
+def admin_report_seen():
+    d = request.get_json() or {}
+    if not _is_owner(d.get('token')):
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    rid = d.get('report_id')
+    conn = get_db(); c = cur(conn)
+    c.execute("UPDATE player_reports SET seen=1 WHERE id=%s", (rid,))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
+@app.route('/admin/report-delete', methods=['POST'])
+def admin_report_delete():
+    d = request.get_json() or {}
+    if not _is_owner(d.get('token')):
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    rid = d.get('report_id')
+    conn = get_db(); c = cur(conn)
+    c.execute("DELETE FROM player_reports WHERE id=%s", (rid,))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
+@app.route('/admin/reports-clear', methods=['POST'])
+def admin_reports_clear():
+    d = request.get_json() or {}
+    if not _is_owner(d.get('token')):
+        return jsonify({'success': False, 'error': 'Нет доступа'}), 403
+    conn = get_db(); c = cur(conn)
+    c.execute("DELETE FROM player_reports")
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
 # ==================== ОБЫЧНЫЕ ЭНДПОИНТЫ ====================
 @app.route('/register', methods=['POST'])
 def register():
@@ -420,6 +501,8 @@ def register():
     except psycopg2.IntegrityError:
         conn.rollback(); return jsonify({'error':'Логин уже занят'}),400
     finally: conn.close()
+
+
 
 @app.route('/login', methods=['POST'])
 def login():
