@@ -7,6 +7,15 @@ from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 CORS(app)
+# ========== АВТОМАТИЧЕСКИЙ ПРЕФИКС /api ДЛЯ ВСЕХ МАРШРУТОВ ==========
+API_PREFIX = '/api'
+_original_route = app.route
+def _api_route(rule, **kwargs):
+    if not rule.startswith(API_PREFIX):
+        rule = API_PREFIX + rule
+    return _original_route(rule, **kwargs)
+app.route = _api_route
+# ====================================================================
 DB_CONFIG = {'host':'localhost','database':'ingsoft_db','user':'ingsoft_user','password':'IngSoft2026!'}
 ONLINE_WINDOW_MS = 5*60*1000
 
